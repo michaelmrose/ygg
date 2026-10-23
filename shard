@@ -312,9 +312,62 @@
         (Thread/sleep 100)
         (recur (dec remaining))))))
 
-(defn- execute! [job ^java.io.File workspace ^java.io.File logfile]
-  ;; No shell interpretation of the user-supplied argv. Linux setsid is an
-  ;; intentional prerequisite for process-group timeout enforcement.
+;; A claim's execution session is recorded before its owner starts waiting.
+;; Even if a worker vanishes after launching a detached test session, the
+;; supervisor can refuse workspace cleanup while that session is alive.
+;; An unrecorded crash is still an incomplete run and cannot be cleaned.
+(def ^:private active-job-process (atom nil))
+(def ^:private worker-interrupted? (atom false))
+(def ^:private session-format :shard/job-session)
+(def ^:private session-no-follow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+
+(defn- record-session! [run id ^Process p]
+  (let [path (.toPath (io/file run "claims" id "session.edn"))]
+    (Files/writeString path
+                       (canonical-edn {:format session-format :version 1
+                                       :pid (.pid p)})
+                       (into-array OpenOption [StandardOpenOption/CREATE_NEW
+                                               StandardOpenOption/WRITE]))))
+
+(defn- assert-no-running-sessions! [run manifest]
+  ;; Fail closed on malformed session evidence. Do not equate a worker's exit
+  ;; with termination of a job that may have spawned background descendants.
+  (doseq [{:keys [id]} (:jobs manifest)
+          :let [session (.toPath (io/file run "claims" id "session.edn"))]
+          :when (Files/exists session session-no-follow)]
+    (require! (Files/isRegularFile session session-no-follow)
+              "Unsafe job-session record; clones retained" {:id id})
+    (let [record (read-edn! (Files/readString session) "job session")
+          pid (:pid record)]
+      (require! (and (map? record)
+                     (= (set (keys record)) #{:format :version :pid})
+                     (= session-format (:format record))
+                     (= 1 (:version record))
+                     (integer? pid) (pos? pid))
+                "Invalid job-session record; clones retained" {:id id})
+      (require! (not (live-in-group? (long pid)))
+                "Test descendants are still running; clones retained"
+                {:job id :process-group pid}))))
+
+(defn- register-shutdown-hook! [f hook-fn]
+  (let [runtime (Runtime/getRuntime)
+        hook (Thread. ^Runnable (reify Runnable
+                                 (run [_]
+                                   (try (hook-fn)
+                                        (catch Throwable e
+                                          (binding [*out* *err*]
+                                            (println "SHARD INTERRUPTION CLEANUP ERROR"
+                                                     (.getMessage e))))))))]
+    (.addShutdownHook runtime hook)
+    (try (f)
+         (finally
+           (try (.removeShutdownHook runtime hook)
+                (catch IllegalStateException _ nil))))))
+
+(defn- execute! [run job ^java.io.File workspace ^java.io.File logfile]
+  ;; Run every test in a distinct Linux process session. Record its PGID in
+  ;; the run basket; neither a successful exit nor a supervisor signal proves
+  ;; that detached descendants have stopped.
   (let [argv (into ["setsid" "--wait" "--"] (:command job))
         builder (ProcessBuilder. ^java.util.List argv)
         env (.environment builder)
@@ -325,28 +378,38 @@
     (.put env "SHARD_JOB_ID" (:id job))
     (.put env "SHARD_WORKSPACE" (.getCanonicalPath workspace))
     (try
-      (let [p (.start builder)
-            finished? (.waitFor p (long (:timeout-ms job)) TimeUnit/MILLISECONDS)]
-        (if finished?
-          (let [exit (.exitValue p)]
-            ;; A command may exit after spawning a background child. Ensure
-            ;; no live process remains in its session before reusing a clone.
-            (when (live-in-group? (.pid p))
-              (terminate-group! p))
-            {:status (if (zero? exit) :passed :failed)
-             :exit-code exit
-             :duration-ms (long (/ (- (System/nanoTime) start) 1000000))})
-          (do
-            (terminate-group! p)
-            {:status :timed-out :exit-code nil
-             :duration-ms (long (/ (- (System/nanoTime) start) 1000000))})))
-      (catch clojure.lang.ExceptionInfo e
-        ;; Process-group termination failure must stop this worker; the
-        ;; job remains claimed and the reporter will mark it incomplete.
-        (throw e))
-      (catch Exception e
+      (let [p (.start builder)]
+        (reset! active-job-process p)
+        (try
+          (record-session! run (:id job) p)
+          (let [finished? (.waitFor p (long (:timeout-ms job))
+                                    TimeUnit/MILLISECONDS)]
+            (if finished?
+              (let [exit (.exitValue p)]
+                (when (live-in-group? (.pid p))
+                  (terminate-group! p))
+                {:status (if (zero? exit) :passed :failed)
+                 :exit-code exit
+                 :duration-ms (long (/ (- (System/nanoTime) start) 1000000))})
+              (do
+                (terminate-group! p)
+                {:status :timed-out :exit-code nil
+                 :duration-ms (long (/ (- (System/nanoTime) start) 1000000))})))
+          (catch Exception ex
+            ;; This includes a failure to write the session record. The job
+            ;; stays claimed if the process group cannot be confirmed dead.
+            (when (live-in-group? (.pid p)) (terminate-group! p))
+            (throw ex))
+          (finally
+            (when-not (live-in-group? (.pid p))
+              (reset! active-job-process nil)))))
+      (catch clojure.lang.ExceptionInfo ex
+        ;; An unverified process-group termination is never downgraded to a
+        ;; ordinary job failure: retaining the clone is mandatory.
+        (throw ex))
+      (catch Exception ex
         {:status :execution-error :exit-code nil
-         :error (str (class e) ": " (.getMessage e))
+         :error (str (class ex) ": " (.getMessage ex))
          :duration-ms (long (/ (- (System/nanoTime) start) 1000000))}))))
 
 (defn- run-claimed-job! [run manifest workspace worker-id job blocked-reason]
@@ -358,7 +421,11 @@
                                        (pr-str (sort blocked-reason)) "\n"))
                      {:status :blocked :exit-code nil :duration-ms 0
                       :blocked-by (vec (sort blocked-reason))})
-                 (execute! job workspace logfile))]
+                 (execute! run job workspace logfile))]
+    ;; A test terminated by the worker's signal handler is NOT an ordinary
+    ;; failed/passed test. Leave its claim incomplete for manual recovery.
+    (require! (not @worker-interrupted?)
+              "Worker interrupted during execution; claim retained")
     (publish-result! run manifest
                      (merge result
                             {:id id :runtime (:runtime job)
@@ -1044,35 +1111,53 @@
     (.redirectOutput b (ProcessBuilder$Redirect/to log))
     {:index index :log log :process (.start b)}))
 
+(defn- terminate-workers! [workers]
+  ;; SIGTERM gives each worker's shutdown hook time to kill its own detached
+  ;; test session. SIGKILL is only used if a worker does not stop gracefully.
+  (doseq [{:keys [^Process process]} workers]
+    (when (.isAlive process) (.destroy process)))
+  (doseq [{:keys [^Process process]} workers]
+    (when-not (.waitFor process 7 TimeUnit/SECONDS)
+      (.destroyForcibly process)
+      (.waitFor process 3 TimeUnit/SECONDS))))
+
 (defn- execute-workers! [run clones manifest]
-  (let [;; Exactly one test worker owns a writable clone at a time.
+  (let [;; Exactly one worker per writable clone, regardless of runtime.
         specs (worker-specs clones (:jobs manifest))
         script (script-command!)
-        started (atom [])]
-    (try
-      (doseq [[i {:keys [workspace runtime]}] (map-indexed vector specs)]
-        (swap! started conj (start-worker! script run workspace runtime (inc i))))
-      (catch Exception ex
-        ;; Do not release the worker lock or clean clones with live children.
-        (doseq [{:keys [^Process process]} @started]
-          (.destroy process))
-        (doseq [{:keys [^Process process]} @started]
-          (when-not (.waitFor process 10 TimeUnit/SECONDS)
-            (.destroyForcibly process)))
-        (doseq [{:keys [^Process process]} @started]
-          (.waitFor process))
-        (fail! "Could not start every Shard worker; clones retained"
-               {:cause (.getMessage ex)})))
-    (let [exits (mapv (fn [{:keys [index log ^Process process]}]
-                        {:worker index :exit (.waitFor process) :log (str log)})
-                      @started)]
-      (doseq [{:keys [worker exit]} exits]
-        (println "SHARD WORKER EXIT" worker exit))
-      (flush)
-      (require! (every? #(zero? (:exit %)) exits)
-                "A Shard worker exited abnormally; clones retained"
-                {:workers exits})
-      exits)))
+        started (atom [])
+        interrupted? (atom false)]
+    (register-shutdown-hook!
+      (fn []
+        (try
+          (doseq [[i {:keys [workspace runtime]}] (map-indexed vector specs)]
+            (swap! started conj (start-worker! script run workspace runtime (inc i))))
+          (catch Exception ex
+            (terminate-workers! @started)
+            (fail! "Could not start every Shard worker; clones retained"
+                   {:cause (.getMessage ex)})))
+        (let [exits (mapv (fn [{:keys [index log ^Process process]}]
+                            {:worker index :exit (.waitFor process) :log (str log)})
+                          @started)]
+          (doseq [{:keys [worker exit]} exits]
+            (println "SHARD WORKER EXIT" worker exit))
+          (flush)
+          (require! (not @interrupted?)
+                    "Shard run interrupted; clones retained")
+          (require! (every? #(zero? (:exit %)) exits)
+                    "A Shard worker exited abnormally; clones retained"
+                    {:workers exits})
+          (assert-no-running-sessions! run manifest)
+          exits))
+      (fn []
+        (reset! interrupted? true)
+        (binding [*out* *err*]
+          (println "SHARD RUN INTERRUPTED; workspaces retained"))
+        (terminate-workers! @started)
+        (try (assert-no-running-sessions! run manifest)
+             (catch Exception ex
+               (binding [*out* *err*]
+                 (println "SHARD UNSAFE TO CLEAN:" (.getMessage ex)))))))))
 
 (defn- parse-run-options! [argv]
   (loop [args (vec argv) n nil]
@@ -1182,7 +1267,15 @@
               stack-index (when index
                             (try (Long/parseLong index)
                                  (catch Exception _ (fail! "Invalid STACK-INDEX"))))]
-          (worker! run-dir workspace runtime idle-ms stack-index)))
+          (register-shutdown-hook!
+            #(worker! run-dir workspace runtime idle-ms stack-index)
+            (fn []
+              (reset! worker-interrupted? true)
+              (when-let [^Process p @active-job-process]
+                (binding [*out* *err*]
+                  (println "SHARD WORKER INTERRUPTED; terminating test session"
+                           (.pid p)))
+                (terminate-group! p))))))
 
       "report"
       (let [[_ run-dir format-option & trailing] args]
