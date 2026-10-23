@@ -1,0 +1,433 @@
+#+TITLE: Ygg / Shard — Implementation Improvement Plan
+#+SUBTITLE: v1073 | Hardening, Gesso Integration, Fine-Grained Parallelism, and Operational Readiness
+#+DATE: 2026-10-21
+#+AUTHOR: Ygg / Shard project
+#+STARTUP: overview
+#+OPTIONS: toc:3 num:t
+#+TODO: NEXT TODO BLOCKED REVIEW | DONE DEFERRED
+
+* Purpose and governing decisions
+
+This is an actionable implementation plan for the standalone Ygg / Shard Git
+repository and its minimal Gesso adapter. It is *not* a claim that live ZFS
+execution, Gesso parallel equivalence, or production-grade isolation has been
+established. The present baseline is useful but not yet operationally proven.
+
+Keep these decisions stable:
+
+- Ygg and Shard remain *separate root-level Babashka executables in the same
+  repository*. Ygg owns ZFS lifecycle and identity checks; Shard owns jobs,
+  claiming, execution, scheduling, accounting, and reporting. Neither imports
+  Gesso application logic.
+- Gesso owns the authoritative test inventory and its gate semantics. =bb test=
+  remains its original sequential suite; =bb test -n N= requests the same
+  coverage using Shard and N isolated workers.
+- The project dataset contains a fixed ordinary =.ygg/= directory, with ZFS
+  clones mounted under =.ygg/workers/1= through =N= and durable run evidence
+  under =.ygg/runs/<run-id>/=. No =.shard.edn=, configurable workspace root,
+  or independently maintained job list.
+- Enumerate all jobs before running. Job IDs are stable; the basket is
+  immutable. Workers claim *one job at a time* through atomic directory
+  creation. Failed jobs do not hold shards; a missing result remains visible.
+- The scheduler is a *preference*, never ownership: reuse a compatible prior
+  allocation and latest run durations, compare with new LPT, improve by moves
+  and swaps, then allow compatible workers to steal individual unstarted jobs.
+- Safety beats automatic recovery: never recursively destroy unknown ZFS
+  objects; never silently reassign an ambiguous claim or clean an active clone.
+- Each code revision is one full-file replacement packaged for =ins=, with a
+  globally increasing revision number shared with Gesso. This document is a
+  single-file v1073 revision; further implementation starts at v1074.
+
+* Source baseline and established/not-established evidence
+
+| Component/file | Baseline | Observed implementation |
+|----------------+----------+-------------------------|
+| Ygg root =ygg= | v1065 | snapshot, clone, GUID verification, worker lock, status, guarded clean |
+| Shard root =shard= | v1072 | immutable inventory, atomic claims, timeout process groups, reports, run orchestration, warm-start scheduling |
+| Ygg tests | v1066 | fake-ZFS lifecycle, identity and cleanup safety checks |
+| Shard tests | v1071 | black-box CLI/worker/orchestration tests, simulated Ygg |
+| Ygg/Shard =bb.edn= | v1070 | automatic discovery of =test/**/*_test.clj= |
+| Gesso =script/gesso_test.clj= | v1067 | authoritative eight-job inventory and existing gate implementations |
+| Gesso =bb.edn= | v1068 | sequential =bb test= and parallel =bb test -n N= dispatch |
+| Gesso integration test | not delivered | =test/gesso/shard_integration_test.clj= planned |
+| Gesso =.gitignore= | not delivered | =/.ygg/= and root lock exclusion planned |
+
+Evidence already obtained: isolated Shard tests and mock orchestration ran;
+previous v1072 checks exercised a two-run warm start and a small scheduling
+example. Ygg fake-ZFS tests exercised unsafe identities and cleanup refusal.
+The *complete combined suite* has not been conclusively established green,
+and no genuine ZFS-host or complete Gesso =bb test -n 8= run has been verified.
+A working source file is not equivalent to a demonstrated safety property.
+
+** Specific source observations to drive the plan
+
+- =ygg= currently creates a root-level =.ygg.lock=. Shard v1072 expressly
+  excludes it from its Git-cleanliness check; Gesso's root =.gitignore= does not
+  yet protect the file from =git add .=. Prefer moving the lock under =.ygg/=.
+- Shard's worker claims use a directory per job; once claimed, a job with no
+  result remains incomplete instead of being stolen automatically.
+- =start-worker!= uses a 60,000 ms idle threshold. A worker may exit while
+  a long prerequisite is still running; that path needs controlled tests and
+  potentially lifecycle correction, not merely a larger constant.
+- =worker-specs= statically distributes runtime identities over clones, then
+  permits stealing only among compatible workers. This can strand idle CPU
+  when runtime groups have uneven work; correctness comes before flexibility.
+- Gesso's eight inventory jobs are gate-sized. The JVM gate invokes
+  =clojure -M:test:formal= for the entire suite. An eight-worker allocation
+  cannot shorten the longest unsplittable gate. The =:formal= entrypoint is a
+  separate focused command, not an additional ninth full-suite inventory job.
+- Browser integration compiles required production runtime artifacts *within
+  its own clone*. A build from a different clone cannot silently satisfy that
+  prerequisite. Current inventory deliberately avoids such cross-clone
+  artifact dependencies.
+- Shard's scheduler takes durations from the latest *complete, validated*
+  run; it does not yet aggregate multiple runs or classify noisy/outlier
+  measurements. The optimizer has a bounded search and is not an exact solver.
+- Workspaces isolate filesystem trees, but a clone does not isolate host
+  ports, shared HOME/TMPDIR, process resources, external services, or caches.
+- Ygg retains source snapshots and Shard retains run logs. Prior run history
+  is included in later snapshots because =.ygg/runs/= is on the source
+  dataset. There is no implemented retention policy.
+
+* Priority policy and release gates
+
+| Priority | Work | Rationale |
+|----------+------+-----------|
+| P0 | Installer compatibility, lock/ignore hygiene, deterministic local tests | Eliminate setup and repeat-run traps |
+| P0 | Real ZFS smoke + fail-closed fault injection | Prove lifecycle on the intended host |
+| P0 | Serial/parallel inventory correspondence and incomplete-run handling | Prevent false-green results |
+| P1 | Split oversized Gesso gates safely, starting with JVM namespaces | Create useful work for balancing and shorten critical path |
+| P1 | Correct long-prerequisite waiting and supervise interruption | Avoid abandoned work and misleading completion |
+| P1 | Fix shared-host collisions with targeted isolation/resources | Make Chromium and XTDB concurrency reliable |
+| P2 | Performance baselines, better timing history, reporting and retention | Measure real gains, keep data manageable |
+| P3 | Persistent JVM/Node processes and complex sandboxing | Consider only when benchmark evidence supports them |
+
+The first usable milestone is not a feature count. It is a repeatable real-host
+run in which *all original gates were executed or explicitly accounted for*,
+no worker leaked, reported outcomes match the sequential suite, and clones
+can be safely removed after an ordinary completed run.
+
+* Phase A — Installation and local safety hygiene
+
+** NEXT A1. Make =ins= support this repository and document files
+
+- Verify that =ins= accepts root =ygg=, root =shard=, root =bb.edn=, and
+  =doc/*.org= or =test/*.clj= replacements, preserving executable modes.
+- Confirm two flat members per installation tar: named full replacement source
+  and matching commit-message text. Preserve ordinary Git staging and the
+  revision number in its commit message.
+- Do not assume the installer already supports unfamiliar root filenames;
+  adjust its target resolution if it does not. Do not weaken its safeguards
+  against placing test namespaces in production paths or vice versa.
+
+Acceptance: a disposable Git repository can install a root executable,
+run a no-op validation, and show the correct path/mode/commit. Bad archive
+shapes fail without changing the repository.
+
+** NEXT A2. Move Ygg's command lock into =.ygg/=
+
+- Replace root =.ygg.lock= with a stable =.ygg/.command.lock= (exact name to be
+  fixed in code/tests), using the existing fail-closed file-channel behavior.
+- Ensure the lock's parent is a verified ordinary directory, never a symlink.
+  Preserve the safety property that concurrent Ygg operations cannot race.
+- Decide and test upgrade behavior if the legacy root lock exists or is
+  currently held. Do not remove or reuse a lock inode while processes may
+  still depend on it; fail explicitly if the old/new locking protocol could
+  race during mixed-version operation.
+- Keep Shard/Ygg =.workers.lock= coordination and all GUID checks unchanged.
+
+Acceptance: consecutive =status=, =create=, =clean=, =status= work without
+introducing root-level untracked artifacts, and competing mutations safely
+refuse rather than racing.
+
+** NEXT A3. Finish Gesso ignore rules and local regression coverage
+
+- Gesso =.gitignore=: ignore =/.ygg/= and any legacy root lock that must still
+  be tolerated during migration. Inspect and preserve the remainder of the
+  existing file instead of replacing it with a generic template.
+- Add/strengthen tests for Git-cleanliness after status, snapshots including
+  existing run history, symlink refusal, interrupted create, and active
+  worker-lock protection.
+- Make the combined =bb test= suite complete on the mock backend without
+  fragile/unbounded subprocess hangs. Put explicit timeouts on fixtures.
+
+Acceptance: after ordinary status or one run, a clean committed repository
+remains clean for the next run; the local suite has a recorded all-green
+result with test/asssertion counts and no real-ZFS dependency.
+
+* Phase B — Real ZFS validation and recovery contract
+
+** TODO B1. Host preflight and non-destructive smoke
+
+Execute on a *disposable or explicitly approved* project ZFS dataset, never
+on an unrelated dataset. Record host ZFS version, dataset/mountpoint, sudo
+policy, Git HEAD, Babashka version, and available disk space.
+
+#+begin_src sh
+# From a disposable clean Git repository whose root IS a ZFS mountpoint:
+ygg status --edn
+ygg -n 2 create
+ygg status --edn
+ygg clean
+ygg status --edn
+#+end_src
+
+Verify clones originate from the recorded snapshot; parent/clone GUIDs,
+mountpoints, and mounted status agree with actual ZFS; the snapshot remains;
+and =.ygg/runs/= survives cleanup. Check ordinary filesystem writes made in
+one clone do not appear in another or the source. Rerun to detect lock and
+stale-state problems.
+
+** TODO B2. Destructive-safety and interruption matrix
+
+Exercise under controlled conditions: an unexpected child ZFS dataset;
+cloned dataset with an altered GUID, origin, mountpoint, or mount state;
+leftover clone without a complete manifest; invalid symlinked state file;
+permission failure mid-create; SIGINT or SIGTERM before/during execution;
+and another process holding the worker lease. Observe refusal and retained
+evidence rather than forcing cleanup.
+
+Acceptance: Ygg never performs recursive or force destruction; it either
+verifies ownership and safely destroys its exact clones or refuses and prints
+a human-actionable reason. Recovery from ambiguous incomplete creation may
+be manual, but must be documented and may not guess ownership.
+
+** TODO B3. Resource and cleanup retention
+
+Establish an explicit manual procedure to identify only *unreferenced*
+Ygg-owned historical snapshots and old run logs. Do not implement automatic
+snapshot deletion until a verified, dry-run-by-default ownership and
+retention contract exists. Measure storage growth before selecting limits.
+
+* Phase C — Gesso correctness and inventory coverage
+
+** TODO C1. Add Gesso Shard integration tests
+
+New file =test/gesso/shard_integration_test.clj= should verify:
+
+- =bb test= and the inventory agree on their *authoritative full-suite gate
+  IDs* (including the current eight jobs and no invented extra =:formal= job).
+- Every job has a valid stable ID, complete command, runtime requirements,
+  timeout, and independent execution contract.
+- Missing/extra/duplicate/renamed gate jobs are reported as mismatches.
+- A deliberately failing individual gate yields a failing Shard report; a
+  missing, unfinished, blocked, or lost job is never counted as passing.
+- The browser integration gate performs its local build; no cross-clone
+  generated file is assumed available.
+- =bb test= still takes its old sequential code path; =-n= changes the
+  execution strategy, not the required test coverage.
+
+Tests should avoid a second complete Gesso suite run during ordinary unit
+testing; use controlled inventories and subprocess fixtures for contracts.
+A live-host acceptance run establishes the real equivalence claim.
+
+** TODO C2. End-to-end Gesso baseline
+
+After Phase B is safe, run a committed known-green Gesso revision through
+=bb test=, =bb test -n 2=, =bb test -n 4=, and, if resource capacity permits,
+=bb test -n 8=. Record each gate's outcome, duration, worker, logs, the Git
+HEAD, and exit status. Compare *sets of executed work* and results, not just
+summary pass counts. Repeat at least once to test warm-start history.
+
+Known hazards to inspect: shared TCP ports, XTDB temporary paths, Chromium
+user-data and profile directories, source-build outputs, Java and Node caches,
+and test-server teardown after timeout. Any collision is a defect requiring
+resource isolation or explicit serialized scheduling—not a flaky-test
+exception.
+
+* Phase D — Correct long-running prerequisites and worker lifecycle
+
+** TODO D1. No premature idle exit while useful work can become ready
+
+A worker must not quit merely because no job was claimable during one fixed
+60-second idle interval if a prerequisite is still running and may complete.
+Distinguish =ready=, =waiting on running prerequisite=, =blocked by failed
+prerequisite=, =claimed-without-result=, and =permanently unrunnable=.
+Use stable basket/results state (or a coordinator signal) for termination;
+avoid spinning indefinitely when progress is genuinely impossible.
+
+Acceptance: a prerequisite longer than the current idle timeout leaves
+other workers able to claim its dependents when it succeeds. Failed
+prerequisites result in explicit blocked outcomes. A disappeared worker
+creates incomplete evidence and a failing overall result, never success.
+
+** TODO D2. Whole-run termination and cancellation
+
+Document and test SIGINT/SIGTERM handling for the supervisor, workers, and
+setsid process groups. Ordinary failures are different from worker crashes.
+Never release the worker lock or invoke Ygg cleanup while test descendants
+remain alive. Capture interrupted run state and provide an explicit manual
+recovery path. A top-level watchdog may be added after failure semantics
+are specified; avoid an unbounded hang.
+
+** TODO D3. Keep runtime affinity honest
+
+Today one clone runs only one worker at a time, runtime group is fixed per
+worker, and work stealing is permitted only among matching runtimes.
+Retain that guarantee. If dynamic runtime switching is eventually added,
+prove that changing tools/caches does not violate worker isolation or
+readiness. Do not introduce it merely to reduce an idle count.
+
+* Phase E — Fine-grained independent test jobs
+
+** TODO E1. Split the JVM gate by test namespace
+
+Gesso currently invokes =clojure -M:test:formal= as one job. Create a
+Gesso-owned namespace inventory using the runner's existing discovery
+semantics; a namespace is a candidate job, not automatically a safe unit.
+Preserve alias/classpath selection, formal/Recife test discovery, and any
+required fixtures. Declare real dependencies for non-independent suites.
+Do not split individual =deftest= forms initially.
+
+The project adapter should expose an independently runnable namespace
+command with typed validation. Verify that the full namespace set executed
+by parallel workers equals the original JVM test set, including when tests
+are added, removed, or moved. Avoid a second hard-coded inventory list.
+
+Acceptance: running all namespace jobs in isolation detects the same
+intentionally broken tests as the original JVM gate; no test silently
+vanishes; each job has stable identity and independently captured results.
+
+** TODO E2. Split other long gates only when safe and worthwhile
+
+Use measured critical-path time to decide whether Node and Chromium tests
+should also be broken into finer jobs. Preserve advanced-compiled runtime
+builds *within the same clone* as consumers, or introduce an explicit
+artifact-dependency mechanism with proven provenance; do not conflate
+cross-clone job dependency edges with shared artifact files.
+
+** TODO E3. Avoid excessive process startup overhead
+
+First measure the cost of launching =clojure= or CLJS for each fine-grained
+job. If startup dominates, consider batching small namespaces or a
+persistent JVM/Node worker protocol, *without* turning the scheduler into a
+static shard allocator. Warm workers introduce fixture/global-state leakage
+and need a dedicated protocol and fresh tests. They are not a prerequisite
+for E1.
+
+* Phase F — Scheduling verification and timing improvements
+
+** TODO F1. Test the existing scheduler against its invariants
+
+For each inventory and worker count, every job ID occurs in exactly one
+preferred stack; runtime compatibility is preserved; no job is reserved by a
+stack; only atomic claims authorize execution; and worker-initiated stealing
+cannot execute the same job twice. Verify no job disappears after a
+partial claim, timeout, or failed prerequisite.
+
+Use deterministic synthetic durations, randomized small inventories, and
+brute-force optimum on tiny cases as an independent reference. Include the
+previously discussed packing case where totals =12,14,13,13= achieve the
+provably optimal makespan 14. Test an allocation that requires a neutral
+intermediate swap to discover an improvement.
+
+** TODO F2. Preserve the warm-start algorithm, improve only with evidence
+
+Retain: prior compatible stack arrangement -> latest actual durations ->
+fresh LPT comparison -> bounded move/swap improvement -> opportunistic
+stealing. The prior arrangement is usable only when job identities,
+worker count, and runtime assignments really match. Reject corrupted,
+incomplete, or mismatched history and fall back safely.
+
+Record predicted loads, observed per-job times, observed worker makespan,
+and the scheduling origin. Compare estimated and actual total wall time.
+Then consider short rolling medians, outlier handling, and separate
+estimates for timeouts/failed tests, only if real results show enough noise
+to justify them. Optimization must be deterministic at fixed inputs and
+must never return a worse score than its chosen LPT/warm candidate.
+
+** TODO F3. Estimate across worker counts without stale affinity
+
+Changing from =-n 4= to =-n 8= invalidates the old four-stack *arrangement*
+but not its validated per-job runtime observations. Preserve useful duration
+history while constructing a fresh N-stack LPT plan. The current code's
+history selection and compatibility checks should be tested explicitly.
+
+* Phase G — Host resource isolation and operational polish
+
+** TODO G1. Fix collisions before adding broad sandbox machinery
+
+Run simultaneous XTDB and Chromium tests with diagnostic port/path logging.
+Give each clone its own writable temporary directory and project-derived
+artifacts; keep shared read-only dependency caches only when safe. If fixed
+ports or globally named services still collide, add project-supplied
+resource/capability constraints, serialize those specific jobs, or use
+per-worker network namespaces where supported. No blanket claim of
+sandbox isolation from ZFS clones alone.
+
+** TODO G2. Improve output, reporting, and run discovery
+
+Preserve complete logs and verified results. Add a convenient latest-run
+status/report command and, when useful, live tagged stdout/stderr streaming.
+Separate evidence collection from human summaries; a failed command's raw
+output should remain inspectable without rewriting history.
+
+** TODO G3. Calibrate worker counts and prevent resource exhaustion
+
+Measure =bb test=, =bb test -n 2=, =-n 4=, =-n 8= under representative
+RAM/CPU conditions. Report total elapsed time, critical path, per-worker
+idle time, peak memory, and overhead from cloning/build startup. A worker
+count beyond the number of runnable jobs should not be advertised as a
+free speedup. Add RAM/CPU budgeting only after contention is observed.
+
+* Proposed revision sequence and one-file discipline
+
+The following is an *ordering*, not a promise of precise completion revision
+numbers. Each deliverable gets the next globally unused revision number and
+its own standard two-member =ins= archive. A failing acceptance test may
+require additional revisions before advancing.
+
+| Order | Repository | Proposed single-file deliverable | Gate |
+|-------+------------+----------------------------------+------|
+| 1 | Ygg/Shard | root =ygg=: move command lock safely | consecutive status/create/clean without root debris |
+| 2 | Ygg/Shard | =test/ygg_test.clj=: lock and safety regression | mock lifecycle suite green |
+| 3 | Gesso | root =.gitignore=: explicit ignores | =git status= clean after Ygg status |
+| 4 | Gesso | =test/gesso/shard_integration_test.clj= | authoritative gate parity and failure accounting |
+| 5 | Ygg/Shard | root =shard=: long-prerequisite worker lifecycle | no premature idle exit |
+| 6 | Ygg/Shard | =test/shard_test.clj=: lifecycle + property tests | race, dependencies, and schedule invariants |
+| 7 | Gesso | =script/gesso_test.clj=: namespace inventory/execution | full JVM namespace coverage |
+| 8 | Gesso | its corresponding regression test file | serial/parallel JVM parity |
+| 9 | Ygg/Shard | scheduling/history or isolation fixes shown necessary by real benchmarks | measured reliability/performance gain |
+
+If root-executable or =doc/= targets are unsupported by =ins=, update and
+verify the installer before treating any archive as installable. A plan file
+need not alter a working source file merely to reserve a revision number.
+
+* Acceptance checklist for a meaningful first release
+
+- [ ] =ins= installs all relevant root/test/doc paths without accidental file
+      relocation or incorrect permissions.
+- [ ] The full Ygg/Shard =bb test= suite completes green with bounded mock
+      subprocesses and reproducible results.
+- [ ] Live ZFS create/status/clean succeeds on the intended host and never
+      silently destroys an unidentified dataset.
+- [ ] Repeated invocations do not leave unignored tracked or untracked
+      repository-root artifacts.
+- [ ] Each Gesso parallel job is in the sequential full-suite contract; every
+      required job yields one terminal result or explicit incomplete state.
+- [ ] Real =bb test -n 2=, =-n 4=, and at least one higher worker count run
+      report consistent outcomes and safely clean after ordinary failures.
+- [ ] A test that waits behind a >60-second prerequisite is still executed
+      when it becomes eligible, or is explicitly accounted for if it cannot.
+- [ ] Concurrent jobs do not collide over ports, writable caches, /tmp,
+      Chromium profiles, or XTDB state.
+- [ ] Scheduler warm starts reuse verified history, remain compatible with
+      job/runtimes, and never compromise atomic work claims.
+- [ ] Basic wall-time and memory measurements justify the chosen defaults;
+      snapshots and logs have a documented safe retention practice.
+
+* Deferred ideas and explicit non-goals
+
+Do not divert this phase into full distributed execution, multi-host leases,
+a novel generic build system, exact NP-hard makespan solving, automatically
+replaying ambiguous claims, or a macro-heavy Clojure scheduling language.
+The design should stay explicit, inspectable Babashka/Clojure code and
+file-backed artifacts. A sophisticated optimizer cannot compensate for one
+indivisible long test or broken process isolation.
+
+* Immediate next action
+
+Start with the root =ygg= lock-path revision and its regression test, then
+finish Gesso's ignore/integration files. Treat a real, disposable ZFS-host
+smoke as the gate before larger feature work. Preserve v1072's working
+scheduler until a reproducible test or benchmark demonstrates a defect.

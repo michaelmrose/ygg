@@ -1,0 +1,40 @@
+{:paths ["test"]
+ :tasks
+ {test
+  {:doc "Run all Ygg/Shard test namespaces with Babashka."
+   :requires ([clojure.java.io :as io]
+              [clojure.string :as str]
+              [clojure.test :as t])
+   :task
+   (let [test-dir (io/file "test")
+         _ (when-not (.isDirectory test-dir)
+             (throw (ex-info "Missing test/ directory" {:directory "test"})))
+         namespaces
+         (->> (file-seq test-dir)
+              (filter (fn [file] (.isFile file)))
+              (filter (fn [file]
+                        (str/ends-with? (.getName file) "_test.clj")))
+              (map (fn [file]
+                     (let [relative (-> (.relativize (.toPath test-dir)
+                                                      (.toPath file))
+                                        str
+                                        (str/replace java.io.File/separator "/"))
+                           without-ext (subs relative 0 (- (count relative) 4))]
+                       (-> without-ext
+                           (str/replace "_" "-")
+                           (str/replace "/" ".")
+                           symbol))))
+              sort
+              vec)]
+     (when (empty? namespaces)
+       (throw (ex-info "No test namespaces found" {:directory "test"})))
+     (when-not (= (count namespaces) (count (distinct namespaces)))
+       (throw (ex-info "Multiple test files map to the same namespace"
+                       {:namespaces namespaces})))
+     (println "Running" (count namespaces) "Ygg/Shard test namespaces:"
+              (str/join ", " namespaces))
+     (doseq [ns namespaces]
+       (require ns))
+     (let [{:keys [fail error]} (apply t/run-tests namespaces)]
+       (when (pos? (+ fail error))
+         (System/exit 1))))}}}

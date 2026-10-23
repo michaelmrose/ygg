@@ -1,0 +1,1213 @@
+#!/usr/bin/env bb
+;; Shard: immutable run enumeration and filesystem-claimed subprocess workers.
+;; Usage: ./shard enumerate CONFIG.edn NEW-RUN-DIR
+;;        ./shard worker RUN-DIR WORKSPACE-DIR RUNTIME [MAX-IDLE-MS] [STACK-INDEX]
+;;        ./shard report RUN-DIR [--edn]
+;;        ./shard gesso-inventory [GESSO-ROOT]  ; EDN on stdout
+;;        ./shard run --workers N [--inventory COMMAND ARG ...]
+(require '[clojure.edn :as edn]
+         '[clojure.java.io :as io]
+         '[clojure.java.shell :as shell]
+         '[clojure.set :as set]
+         '[clojure.string :as str])
+(import '[java.nio.file Files FileAlreadyExistsException LinkOption
+          StandardCopyOption Path]
+        '[java.nio.file.attribute FileAttribute]
+        '[java.security MessageDigest]
+        '[java.io PushbackReader StringReader]
+        '[java.nio.channels FileChannel]
+        '[java.nio.file StandardOpenOption OpenOption]
+        '[java.time Instant]
+        [java.util UUID]
+        [java.util.concurrent TimeUnit]
+        [java.lang ProcessBuilder ProcessBuilder$Redirect])
+
+(def ^:private id-pattern #"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+(def ^:private no-attributes (make-array FileAttribute 0))
+(def ^:private allowed-config
+  #{:version :project-root :runtimes :jobs :inventory-command})
+(def ^:private allowed-job
+  #{:id :gate :runtime :unit :command :depends-on :timeout-ms :requires})
+(def ^:private allowed-runtime #{:identity :capabilities})
+
+(defn- fail! [message & [data]]
+  (throw (ex-info message (or data {}))))
+
+(defn- require! [condition message & [data]]
+  (when-not condition (fail! message data)))
+
+(defn- strict-keys! [m allowed where]
+  (require! (map? m) (str where " must be an EDN map"))
+  (let [extra (set/difference (set (keys m)) allowed)]
+    (require! (empty? extra) (str where " has unknown keys")
+              {:keys (sort-by str extra)})))
+
+(defn- id? [x] (and (string? x) (boolean (re-matches id-pattern x))))
+(defn- string-vector? [x]
+  (and (vector? x) (seq x) (every? #(and (string? %) (not (str/blank? %))) x)))
+(defn- keyword-set? [x] (and (set? x) (every? keyword? x)))
+
+(defn- read-edn! [text source]
+  (try
+    (with-open [reader (PushbackReader. (StringReader. text))]
+      (let [options {:eof ::eof :readers {} :default (fn [tag _]
+                                                     (fail! (str "Unsupported EDN tag in " source)
+                                                            {:tag tag}))}
+            value (edn/read options reader)]
+        (require! (not= ::eof value) (str "Empty EDN in " source))
+        (require! (= ::eof (edn/read options reader))
+                  (str "Multiple EDN forms in " source))
+        value))
+    (catch Exception ex
+      (fail! (str "Invalid EDN in " source ": " (.getMessage ex))))))
+
+(defn- resolve-root! [config-file project-root]
+  (require! (string? project-root) ":project-root must be a string")
+  (let [parent (.getParentFile (.getCanonicalFile (io/file config-file)))
+        root (io/file project-root)
+        canonical (.getCanonicalFile (if (.isAbsolute root) root (io/file parent project-root)))]
+    (require! (.isDirectory canonical) "Project root must exist and be a directory"
+              {:path (str canonical)})
+    (.getPath canonical)))
+
+(defn- validate-runtimes! [runtimes]
+  (require! (and (map? runtimes) (seq runtimes))
+            ":runtimes must be a nonempty map")
+  (doseq [[name description] runtimes]
+    (require! (keyword? name) "Runtime key must be a keyword" {:runtime name})
+    (strict-keys! description allowed-runtime (str "Runtime " name))
+    (require! (and (string? (:identity description))
+                   (not (str/blank? (:identity description))))
+              "Runtime must declare a nonempty :identity" {:runtime name})
+    (require! (keyword-set? (get description :capabilities #{}))
+              "Runtime :capabilities must be a set of keywords" {:runtime name}))
+  runtimes)
+
+(defn- validate-job! [job runtimes]
+  (strict-keys! job allowed-job "Job")
+  (let [{:keys [id gate runtime command unit depends-on timeout-ms requires]} job]
+    (require! (id? id) "Job ID must be a safe nonempty string" {:id id})
+    (require! (keyword? gate) "Job must declare a keyword :gate" {:id id})
+    (require! (contains? runtimes runtime) "Job has unknown runtime"
+              {:id id :runtime runtime})
+    (require! (string-vector? command)
+              "Job :command must be a nonempty vector of argument strings" {:id id})
+    (require! (and (map? unit) (keyword? (:type unit)))
+              "Job :unit must be a map with keyword :type" {:id id})
+    (require! (and (vector? depends-on) (every? id? depends-on)
+                   (= (count depends-on) (count (distinct depends-on))))
+              "Job :depends-on must be a vector of distinct job IDs" {:id id})
+    (require! (and (integer? timeout-ms) (<= 1 timeout-ms 86400000))
+              "Job :timeout-ms must be 1..86400000" {:id id})
+    (require! (keyword-set? requires)
+              "Job :requires must be a set of capability keywords" {:id id})
+    (require! (set/subset? requires (get-in runtimes [runtime :capabilities] #{}))
+              "Job requirements are not supported by its runtime" {:id id})
+    (assoc job :depends-on (vec (sort depends-on)))))
+
+(defn- acyclic! [jobs]
+  (let [by-id (into {} (map (juxt :id identity) jobs))
+        visited (atom #{})
+        visiting (atom #{})]
+    (letfn [(visit [id]
+              (when (contains? @visiting id)
+                (fail! "Cycle in job prerequisites" {:at id}))
+              (when-not (contains? @visited id)
+                (swap! visiting conj id)
+                (doseq [parent (:depends-on (by-id id))] (visit parent))
+                (swap! visiting disj id)
+                (swap! visited conj id)))]
+      (doseq [id (sort (keys by-id))] (visit id))))
+  jobs)
+
+(defn- validate-jobs! [jobs runtimes]
+  (require! (and (vector? jobs) (seq jobs))
+            "Inventory must contain a nonempty :jobs vector")
+  (let [cleaned (mapv #(validate-job! % runtimes) jobs)
+        ids (mapv :id cleaned)
+        all-ids (set ids)]
+    (require! (= (count ids) (count all-ids))
+              "Duplicate job IDs" {:ids (frequencies ids)})
+    (doseq [job cleaned, parent (:depends-on job)]
+      (require! (contains? all-ids parent)
+                "Unknown prerequisite" {:id (:id job) :depends-on parent})
+      (require! (not= (:id job) parent)
+                "Job cannot depend on itself" {:id (:id job)}))
+    (-> cleaned acyclic! (->> (sort-by :id) vec))))
+
+(defn- inventory-jobs! [config root]
+  (let [explicit? (contains? config :jobs)
+        command? (contains? config :inventory-command)]
+    (require! (not= explicit? command?)
+              "Supply exactly one of :jobs or :inventory-command")
+    (if explicit?
+      (:jobs config)
+      (let [cmd (:inventory-command config)]
+        (require! (string-vector? cmd)
+                  ":inventory-command must be a nonempty vector of argument strings")
+        ;; No shell interpolation. The project adapter must emit only EDN on stdout.
+        (let [result (apply shell/sh (concat cmd [:dir root]))]
+          (require! (zero? (:exit result)) "Inventory command failed"
+                    {:exit (:exit result) :stderr (:err result)})
+          (let [output (read-edn! (:out result) "inventory command")]
+            (strict-keys! output #{:jobs} "Inventory command output")
+            (:jobs output)))))))
+
+(defn- digest [s]
+  (let [bytes (.digest (doto (MessageDigest/getInstance "SHA-256")
+                         (.update (.getBytes s "UTF-8"))))]
+    (apply str (map #(format "%02x" (bit-and 255 %)) bytes))))
+
+(defn- canonical-edn [m]
+  (letfn [(stable [value]
+            (cond
+              (map? value) (into (sorted-map-by #(compare (pr-str %1) (pr-str %2)))
+                                 (map (fn [[k v]] [k (stable v)])) value)
+              (set? value) (into (sorted-set-by #(compare (pr-str %1) (pr-str %2)))
+                                 (map stable value))
+              (vector? value) (mapv stable value)
+              (sequential? value) (mapv stable value)
+              :else value))]
+    (str (pr-str (stable m)) "\n")))
+
+(defn- manifest! [config-path]
+  (let [config (read-edn! (slurp config-path) (str config-path))]
+    (strict-keys! config allowed-config "Config")
+    (require! (= 1 (:version config)) "Shard config :version must be 1")
+    (let [root (resolve-root! config-path (:project-root config))
+          runtimes (validate-runtimes! (:runtimes config))
+          jobs (validate-jobs! (inventory-jobs! config root) runtimes)
+          inventory {:project-root root :runtimes runtimes :jobs jobs}]
+      {:format :shard/jobs :version 1
+       :created-at (str (Instant/now))
+       :inventory-sha256 (digest (canonical-edn inventory))
+       :project-root root
+       :runtimes runtimes
+       :jobs jobs})))
+
+(defn- publish! [destination manifest]
+  (let [dir (.toPath (io/file destination))
+        ;; Requiring a new run directory makes run publication exclusive.
+        ;; Each worker will later share this one directory outside the clones.
+        _ (Files/createDirectory dir no-attributes)
+        tmp (.resolve dir ".jobs-writing.edn")
+        final (.resolve dir "jobs.edn")]
+    (try
+      (doseq [name ["claims" "results" "logs"]]
+        (Files/createDirectory (.resolve dir name) no-attributes))
+      (spit (.toFile tmp) (canonical-edn manifest))
+      ;; jobs.edn is the publication marker. Never emit it before setup.
+      (Files/move tmp final (into-array java.nio.file.CopyOption
+                                        [StandardCopyOption/ATOMIC_MOVE]))
+      (catch Exception ex
+        ;; Leave the incomplete run directory visible; never pretend it is
+        ;; a valid published run or overwrite it on subsequent invocations.
+        (fail! "Could not publish run; incomplete run directory retained"
+               {:directory (str dir) :cause (.getMessage ex)})))))
+
+
+;; A run's manifest is immutable, and the job basket is a directory tree.
+;; Claim ownership is only for ONE job, never for a worker or its workspace.
+;; A failed job keeps its claim and receives an immutable terminal result.
+(def ^:private terminal-statuses #{:passed :failed :timed-out :execution-error :blocked})
+
+(defn- read-manifest! [run]
+  (let [f (io/file run "jobs.edn")]
+    (require! (.isFile f) "Run has no published jobs.edn" {:run (str run)})
+    (let [m (read-edn! (slurp f) "run manifest")]
+      (require! (and (= :shard/jobs (:format m)) (= 1 (:version m)))
+                "Unsupported run-manifest format")
+      (let [runtimes (validate-runtimes! (:runtimes m))
+            jobs (validate-jobs! (:jobs m) runtimes)
+            inventory {:project-root (:project-root m) :runtimes runtimes :jobs jobs}]
+        (require! (= (:inventory-sha256 m) (digest (canonical-edn inventory)))
+                  "Run-manifest fingerprint mismatch")
+        (require! (and (string? (:project-root m))
+                       (not (str/blank? (:project-root m))))
+                  "Run-manifest project root is missing")
+        (doseq [part ["claims" "results" "logs"]]
+          (require! (Files/isDirectory (.toPath (io/file run part))
+                                       (make-array LinkOption 0))
+                    "Missing run directory" {:name part}))
+        (assoc m :jobs jobs)))))
+
+(defn- read-results! [run manifest]
+  (let [dir (io/file run "results")]
+    (into {}
+          (for [{:keys [id]} (:jobs manifest)
+                :let [f (io/file dir (str id ".edn"))]
+                :when (.exists f)]
+            (let [r (read-edn! (slurp f) (str f))]
+              (require! (and (map? r) (= :shard/job-result (:format r))
+                             (= 1 (:version r)) (= id (:id r))
+                             (= (:inventory-sha256 manifest) (:inventory-sha256 r))
+                             (terminal-statuses (:status r)))
+                        "Unrecognized or mismatched job result"
+                        {:job id :file (str f)})
+              [id r])))))
+
+(defn- atomic-claim! [run job-id]
+  (let [claim (.toPath (io/file run "claims" job-id))]
+    (try
+      (Files/createDirectory claim no-attributes)
+      true
+      (catch FileAlreadyExistsException _ false))))
+
+(defn- publish-result! [run manifest result]
+  (let [dir (.toPath (io/file run "results"))
+        id (:id result)
+        tmp (.resolve dir (str "." id "." (UUID/randomUUID) ".tmp"))
+        dest (.resolve dir (str id ".edn"))]
+    ;; A hard link publishes a COMPLETE file atomically with CREATE_NEW
+    ;; semantics. Unlike an ATOMIC_MOVE, it may not replace an existing result.
+    (try
+      (spit (.toFile tmp) (canonical-edn
+                             (assoc result :format :shard/job-result
+                                           :version 1
+                                           :inventory-sha256 (:inventory-sha256 manifest))))
+      (Files/createLink dest tmp)
+      (finally
+        (Files/deleteIfExists tmp)))))
+
+(defn- signal-group! [signal pid]
+  ;; Tests run in sessions created by `setsid`. A process-group signal reaches
+  ;; descendants still in that session, not merely the first process.
+  (let [p (.start (ProcessBuilder. ^java.util.List
+                                   ["kill" (str "-" signal) "--" (str "-" pid)]))]
+    (.waitFor p 5 TimeUnit/SECONDS)
+    (zero? (.exitValue p))))
+
+(defn- live-in-group? [group-pid]
+  ;; Linux may retain zombie processes in a group after its members have
+  ;; terminated. `kill -0 -PGID` reports zombies as present, so check the
+  ;; actual /proc state and distinguish them from still-running processes.
+  (let [proc (io/file "/proc")]
+    (require! (.isDirectory proc) "Linux /proc is required for timeout verification")
+    (boolean
+      (some (fn [^java.io.File entry]
+              (when (re-matches #"[0-9]+" (.getName entry))
+                (try
+                  (let [stat (slurp (io/file entry "stat"))
+                        i (.lastIndexOf stat ")")
+                        fields (str/split (subs stat (+ i 2)) #"\s+")
+                        state (nth fields 0)
+                        group (Long/parseLong (nth fields 2))]
+                    (and (= group group-pid) (not= state "Z") (not= state "X")))
+                  (catch java.io.IOException _ false)
+                  (catch java.lang.NumberFormatException _ false))))
+            (.listFiles proc)))))
+
+(defn- terminate-group! [^Process p]
+  (let [pid (.pid p)]
+    (signal-group! "TERM" pid)
+    (.waitFor p 1200 TimeUnit/MILLISECONDS)
+    (when (live-in-group? pid)
+      (signal-group! "KILL" pid))
+    (.waitFor p 1500 TimeUnit/MILLISECONDS)
+    (loop [remaining 12]
+      (when (live-in-group? pid)
+        (require! (pos? remaining)
+                  "Timed-out process group may still be alive; stopping worker"
+                  {:pid pid})
+        (Thread/sleep 100)
+        (recur (dec remaining))))))
+
+(defn- execute! [job ^java.io.File workspace ^java.io.File logfile]
+  ;; No shell interpretation of the user-supplied argv. Linux setsid is an
+  ;; intentional prerequisite for process-group timeout enforcement.
+  (let [argv (into ["setsid" "--wait" "--"] (:command job))
+        builder (ProcessBuilder. ^java.util.List argv)
+        env (.environment builder)
+        start (System/nanoTime)]
+    (.directory builder workspace)
+    (.redirectErrorStream builder true)
+    (.redirectOutput builder (ProcessBuilder$Redirect/to logfile))
+    (.put env "SHARD_JOB_ID" (:id job))
+    (.put env "SHARD_WORKSPACE" (.getCanonicalPath workspace))
+    (try
+      (let [p (.start builder)
+            finished? (.waitFor p (long (:timeout-ms job)) TimeUnit/MILLISECONDS)]
+        (if finished?
+          (let [exit (.exitValue p)]
+            ;; A command may exit after spawning a background child. Ensure
+            ;; no live process remains in its session before reusing a clone.
+            (when (live-in-group? (.pid p))
+              (terminate-group! p))
+            {:status (if (zero? exit) :passed :failed)
+             :exit-code exit
+             :duration-ms (long (/ (- (System/nanoTime) start) 1000000))})
+          (do
+            (terminate-group! p)
+            {:status :timed-out :exit-code nil
+             :duration-ms (long (/ (- (System/nanoTime) start) 1000000))})))
+      (catch clojure.lang.ExceptionInfo e
+        ;; Process-group termination failure must stop this worker; the
+        ;; job remains claimed and the reporter will mark it incomplete.
+        (throw e))
+      (catch Exception e
+        {:status :execution-error :exit-code nil
+         :error (str (class e) ": " (.getMessage e))
+         :duration-ms (long (/ (- (System/nanoTime) start) 1000000))}))))
+
+(defn- run-claimed-job! [run manifest workspace worker-id job blocked-reason]
+  (let [id (:id job)
+        logfile (io/file run "logs" (str id ".log"))
+        start (Instant/now)
+        result (if blocked-reason
+                 (do (spit logfile (str "Blocked by unsuccessful prerequisite(s): "
+                                       (pr-str (sort blocked-reason)) "\n"))
+                     {:status :blocked :exit-code nil :duration-ms 0
+                      :blocked-by (vec (sort blocked-reason))})
+                 (execute! job workspace logfile))]
+    (publish-result! run manifest
+                     (merge result
+                            {:id id :runtime (:runtime job)
+                             :worker-id worker-id
+                             :started-at (str start)
+                             :completed-at (str (Instant/now))
+                             :log (str "logs/" id ".log")}))
+    (println "SHARD JOB" id (name (:status result)))
+    (flush)))
+
+(declare schedule-for-worker!)
+
+;; MAX-IDLE-MS is a grace period for genuinely stalled prerequisites, not a
+;; deadline for a healthy job that another worker has already claimed. Claims
+;; themselves remain immutable and are never stolen. The claim directory's
+;; creation time plus its declared execution timeout bounds our willingness
+;; to wait for a missing result (including a crashed worker). This is a
+;; conservative liveness hint, NOT proof that its owning process is alive.
+(def ^:private claim-startup-grace-ms 5000)
+(def ^:private no-follow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+
+(defn- fresh-inflight-claim? [run manifest results now]
+  (boolean
+    (some (fn [{:keys [id timeout-ms]}]
+            (when-not (contains? results id)
+              (let [path (.toPath (io/file run "claims" id))]
+                (when (Files/isDirectory path no-follow)
+                  (let [created (.toMillis
+                                  (Files/getLastModifiedTime path no-follow))]
+                    (and (<= created (+ now claim-startup-grace-ms))
+                         (< now (+ created (long timeout-ms)
+                                   claim-startup-grace-ms))))))))
+          (:jobs manifest))))
+
+(defn- worker! [run-path workspace-path runtime-name max-idle schedule-index]
+  (let [run (.getCanonicalFile (io/file run-path))
+        workspace (.getCanonicalFile (io/file workspace-path))
+        manifest (read-manifest! run)
+        runtime (keyword (str/replace runtime-name #"^:" ""))
+        _ (require! (contains? (:runtimes manifest) runtime)
+                    "Unknown worker runtime" {:runtime runtime})
+        _ (require! (and (.isDirectory workspace) (.canRead workspace))
+                    "Workspace must be an existing accessible directory")
+        _ (require! (and (not (.startsWith (.toPath run) (.toPath workspace)))
+                         (not (.startsWith (.toPath workspace) (.toPath run))))
+                    "Run basket must be outside the execution workspace")
+        _ (require! (and (integer? max-idle) (<= 0 max-idle 86400000))
+                    "MAX-IDLE-MS must be between 0 and 86400000")
+        worker-id (str (UUID/randomUUID))
+        allowed (filterv #(= runtime (:runtime %)) (:jobs manifest))
+        preferred (when schedule-index
+                    (schedule-for-worker! run manifest runtime schedule-index))
+        by-id (into {} (map (juxt :id identity) allowed))
+        matching (if preferred (mapv by-id preferred) allowed)]
+    (println "SHARD WORKER" worker-id "runtime" runtime "jobs" (count matching))
+    (flush)
+    (loop [idle-start (System/currentTimeMillis)]
+      (let [results (read-results! run manifest)
+            outstanding (filterv #(not (contains? results (:id %))) matching)
+            unclaimed (filterv #(not (.exists (io/file run "claims" (:id %))))
+                               outstanding)
+            decision (some (fn [job]
+                             (let [deps (:depends-on job)
+                                   bad (filterv #(and (contains? results %)
+                                                      (not= :passed (:status (results %)))) deps)]
+                               (cond
+                                 (seq bad) [job bad]
+                                 (every? #(= :passed (:status (results %))) deps)
+                                 [job nil]
+                                 :else nil))) unclaimed)
+            now (System/currentTimeMillis)]
+        (cond
+          (empty? outstanding)
+          (do (println "SHARD WORKER DONE" worker-id) (flush))
+
+          decision
+          (let [[job blocked-reason] decision]
+            (if (atomic-claim! run (:id job))
+              (do (run-claimed-job! run manifest workspace worker-id job blocked-reason)
+                  (recur (System/currentTimeMillis)))
+              (recur idle-start)))
+
+          ;; Every unfinished compatible job already has an owner. There is
+          ;; nothing left for THIS worker to claim, even when some owners have
+          ;; not published results. The reporter will account for them.
+          (empty? unclaimed)
+          (do (println "SHARD WORKER DRAINED" worker-id
+                       "claimed" (count outstanding))
+              (flush))
+
+          ;; Dependent jobs are still unclaimed. Do not retire their workers
+          ;; merely because a prerequisite is running longer than the usual
+          ;; idle grace. Look across ALL runtimes: a JVM job may unlock a Node
+          ;; job. An overdue/abandoned claim does not extend this wait forever.
+          (or (< (- now idle-start) max-idle)
+              (fresh-inflight-claim? run manifest results now))
+          (do (Thread/sleep 100) (recur idle-start))
+
+          :else
+          (do (println "SHARD WORKER IDLE" worker-id
+                       "unresolved" (count outstanding)
+                       "unclaimed" (count unclaimed))
+              (flush)))))))
+
+;; Reporting reads only completed, immutable results. It never claims jobs,
+;; releases claims, retries work, or mutates an active run.
+(def ^:private result-keys
+  #{:format :version :inventory-sha256 :id :runtime :worker-id
+    :started-at :completed-at :log :status :exit-code :duration-ms
+    :blocked-by :error})
+(def ^:private report-status-order
+  [:passed :failed :timed-out :execution-error :blocked
+   :claimed-without-result :waiting :ready])
+
+(defn- safe-entries! [dir]
+  (require! (Files/isDirectory (.toPath (io/file dir))
+                               (make-array LinkOption 0))
+            "Missing or unsafe run directory" {:path (str dir)})
+  (let [entries (.listFiles (io/file dir))]
+    (require! (some? entries) "Cannot enumerate run directory"
+              {:path (str dir)})
+    (seq entries)))
+
+(defn- check-artifact! [^java.io.File f directory?]
+  (let [p (.toPath f)
+        opts (into-array LinkOption [LinkOption/NOFOLLOW_LINKS])]
+    (require! (if directory?
+                (Files/isDirectory p opts)
+                (Files/isRegularFile p opts))
+              "Unexpected or unsafe run artifact"
+              {:path (str f) :expected (if directory? :directory :regular-file)})))
+
+(defn- scan-artifacts! [run job-ids]
+  (let [claims (safe-entries! (io/file run "claims"))
+        results (safe-entries! (io/file run "results"))
+        logs (safe-entries! (io/file run "logs"))
+        publishing-pattern #"\.([A-Za-z0-9][A-Za-z0-9._-]{0,127})\.([0-9a-fA-F-]{36})\.tmp"]
+    (doseq [f claims]
+      (require! (contains? job-ids (.getName f))
+                "Unexpected job-claim entry" {:path (str f)})
+      (check-artifact! f true))
+    (let [temporary (atom [])]
+      (doseq [f results]
+        (let [n (.getName f)
+              id (when (str/ends-with? n ".edn") (subs n 0 (- (count n) 4)))
+              match (re-matches publishing-pattern n)]
+          (cond
+            (and id (contains? job-ids id))
+            (check-artifact! f false)
+
+            (and match (contains? job-ids (second match)))
+            (do (check-artifact! f false)
+                (swap! temporary conj n))
+
+            :else (fail! "Unexpected job-result entry" {:path (str f)}))))
+      (doseq [f logs]
+        (let [n (.getName f)
+              id (when (str/ends-with? n ".log") (subs n 0 (- (count n) 4)))]
+          (require! (contains? job-ids id) "Unexpected job-log entry" {:path (str f)})
+          (check-artifact! f false)))
+      {:claims (set (map #(.getName ^java.io.File %) claims))
+       :logs (set (map #(.getName ^java.io.File %) logs))
+       :unpublished (vec (sort @temporary))})))
+
+(defn- parse-instant! [text field id]
+  (require! (and (string? text) (not (str/blank? text)))
+            "Missing job timestamp" {:id id :field field})
+  (try
+    (Instant/parse text)
+    (catch Exception _
+      (fail! "Invalid job timestamp" {:id id :field field :value text}))))
+
+(defn- validate-result! [by-id results artifacts id result]
+  (let [job (by-id id)
+        deps (:depends-on job)
+        status (:status result)
+        [start done] [(parse-instant! (:started-at result) :started-at id)
+                      (parse-instant! (:completed-at result) :completed-at id)]]
+    (strict-keys! result result-keys (str "Result " id))
+    (require! (contains? (:claims artifacts) id)
+              "Result exists without a job claim" {:id id})
+    (require! (= (:runtime result) (:runtime job))
+              "Result runtime does not match job" {:id id})
+    (require! (and (string? (:worker-id result))
+                   (not (str/blank? (:worker-id result))))
+              "Result is missing worker identity" {:id id})
+    (require! (not (.isAfter start done))
+              "Result completed before it started" {:id id})
+    (require! (and (integer? (:duration-ms result))
+                   (<= 0 (:duration-ms result)))
+              "Result has invalid duration" {:id id})
+    (require! (= (str "logs/" id ".log") (:log result))
+              "Result log does not match job" {:id id})
+    (require! (contains? (:logs artifacts) (str id ".log"))
+              "Result log is missing" {:id id})
+    (case status
+      :passed (require! (and (integer? (:exit-code result))
+                             (zero? (:exit-code result)))
+                        "Passed result has nonzero or absent exit code" {:id id})
+      :failed (require! (and (integer? (:exit-code result))
+                             (not (zero? (:exit-code result))))
+                        "Failed result has zero or absent exit code" {:id id})
+      (:timed-out :execution-error :blocked)
+      (require! (nil? (:exit-code result))
+                "Non-exit result has an exit code" {:id id})
+      (fail! "Invalid job status" {:id id :status status}))
+    (if (= status :blocked)
+      (let [bad (:blocked-by result)]
+        (require! (and (vector? bad) (seq bad)
+                       (= (count bad) (count (distinct bad)))
+                       (every? #(some #{%} deps) bad)
+                       (every? #(and (contains? results %)
+                                     (not= :passed (:status (results %)))) bad))
+                  "Blocked result lacks a failed declared prerequisite"
+                  {:id id :blocked-by bad}))
+      (require! (every? #(= :passed (:status (results %))) deps)
+                "Executed job has incomplete or unsuccessful prerequisites"
+                {:id id :depends-on deps}))
+    (require! (if (= status :blocked)
+                (not (contains? result :error))
+                (not (contains? result :blocked-by)))
+              "Result has inconsistent status-specific fields" {:id id})
+    (require! (if (= status :execution-error)
+                (and (string? (:error result)) (not (str/blank? (:error result))))
+                (not (contains? result :error)))
+              "Result has invalid execution error field" {:id id})
+    result))
+
+(defn- report-data! [run-path]
+  (let [run (.getCanonicalFile (io/file run-path))
+        manifest (read-manifest! run)
+        jobs (:jobs manifest)
+        by-id (into {} (map (juxt :id identity) jobs))
+        artifacts (scan-artifacts! run (set (keys by-id)))
+        results (read-results! run manifest)]
+    (doseq [[id result] results]
+      (validate-result! by-id results artifacts id result))
+    (let [entries (mapv (fn [{:keys [id gate runtime depends-on]}]
+                          (let [result (get results id)
+                                status (if result
+                                         (:status result)
+                                         (cond
+                                           (contains? (:claims artifacts) id) :claimed-without-result
+                                           (every? #(= :passed (:status (get results %))) depends-on) :ready
+                                           :else :waiting))]
+                            (cond-> {:id id :gate gate :runtime runtime :status status}
+                              result (assoc :duration-ms (:duration-ms result)
+                                            :log (:log result)
+                                            :worker-id (:worker-id result))
+                              (and result (= :blocked status))
+                              (assoc :blocked-by (:blocked-by result))))) jobs)
+          counts (merge (zipmap report-status-order (repeat 0))
+                        (frequencies (map :status entries)))
+          completed (count results)
+          done? (= completed (count jobs))
+          clean? (empty? (:unpublished artifacts))
+          overall (cond
+                    (not (and done? clean?)) :incomplete
+                    (= (get counts :passed) (count jobs)) :pass
+                    :else :fail)]
+      {:format :shard/report :version 1
+       :inventory-sha256 (:inventory-sha256 manifest)
+       :total (count jobs) :completed completed
+       :overall overall :counts counts
+       :unpublished (:unpublished artifacts)
+       :jobs entries})))
+
+(defn- print-report! [report]
+  (println "SHARD REPORT" (name (:overall report)))
+  (println "Jobs:" (:total report) "Completed:" (:completed report))
+  (doseq [status report-status-order]
+    (println (format "  %-24s %d" (name status) (get-in report [:counts status]))))
+  (when (seq (:unpublished report))
+    (println "Unpublished result files:" (pr-str (:unpublished report))))
+  (doseq [{:keys [id status log blocked-by]} (:jobs report)
+          :when (not= status :passed)]
+    (println (str "  " id ": " (name status)
+                  (when log (str " [" log "]"))
+                  (when (seq blocked-by) (str " blocked-by=" (pr-str blocked-by))))))
+  (flush))
+
+(defn- report! [run-path as-edn?]
+  (let [report (report-data! run-path)]
+    (if as-edn?
+      (print (canonical-edn report))
+      (print-report! report))
+    (flush)
+    (when-not (= :pass (:overall report))
+      (System/exit 1))))
+
+
+;; A schedule is an immutable *preference* over the same shared job basket.
+;; No schedule ever grants a worker ownership of jobs; Files/createDirectory
+;; remains the only claim authority. Runtime groups constrain possible steals.
+(def ^:private schedule-format :shard/schedule)
+
+(defn- worker-specs [clones jobs]
+  (let [runtimes (vec (sort (set (map :runtime jobs))))]
+    (require! (<= (count runtimes) (count clones))
+              "More runtime groups than isolated workspaces")
+    (mapv (fn [i clone]
+            {:index (inc i)
+             :workspace (:mountpoint clone)
+             :runtime (nth runtimes (mod i (count runtimes)))})
+          (range (count clones)) clones)))
+
+(defn- valid-queues? [queues specs jobs]
+  (let [ids (mapcat identity queues)
+        by-id (into {} (map (juxt :id identity) jobs))]
+    (and (vector? queues)
+         (= (count queues) (count specs))
+         (every? vector? queues)
+         (= (count ids) (count jobs))
+         (= (set ids) (set (keys by-id)))
+         (= (count ids) (count (distinct ids)))
+         (every? true?
+                 (for [[spec queue] (map vector specs queues)
+                       id queue]
+                   (= (:runtime spec) (:runtime (by-id id))))))))
+
+(defn- score-queues [queues estimated]
+  (let [loads (mapv #(reduce + 0 (map estimated %)) queues)]
+    [(apply max 0 loads)
+     (reduce + 0N (map #(*' % %) loads))]))
+
+(defn- lpt-queues [jobs specs estimated]
+  (reduce (fn [queues {:keys [id runtime]}]
+            (let [targets (keep-indexed
+                            (fn [i spec] (when (= runtime (:runtime spec)) i))
+                            specs)
+                  candidate (first (sort-by
+                                      (fn [i] [(reduce + 0 (map estimated (queues i))) i])
+                                      targets))]
+              (update queues candidate conj id)))
+          (vec (repeat (count specs) []))
+          (sort-by (fn [{:keys [id]}] [(- (estimated id)) id]) jobs)))
+
+(defn- neighbor-queues [queues specs]
+  ;; Generate one-move and one-swap neighbors lazily, honoring runtime groups.
+  ;; Duplicate arrangements are harmless; the optimizer's bounded deadline
+  ;; prevents runaway exploration on very large inventories.
+  (let [n (count queues)]
+    (concat
+      (for [from (range n)
+            to (range n)
+            :when (and (not= from to)
+                       (= (:runtime (specs from)) (:runtime (specs to))))
+            id (queues from)]
+        (-> queues
+            (update from #(vec (remove #{id} %)))
+            (update to conj id)))
+      (for [from (range n)
+            to (range (inc from) n)
+            :when (= (:runtime (specs from)) (:runtime (specs to)))
+            id-a (queues from)
+            id-b (queues to)]
+        (-> queues
+            (update from #(mapv (fn [id] (if (= id id-a) id-b id)) %))
+            (update to #(mapv (fn [id] (if (= id id-b) id-a id)) %)))))))
+
+(defn- improve-queues [initial specs estimated]
+  ;; Best-improving local search. Equal-makespan moves can still improve the
+  ;; secondary balance metric. A bounded depth-two plateau search handles
+  ;; cases where a neutral swap unlocks a later makespan improvement.
+  (let [deadline (+ (System/nanoTime) 500000000)]
+    (loop [best initial iteration 0]
+      (if (or (>= iteration 32) (>= (System/nanoTime) deadline))
+        best
+        (let [baseline (score-queues best estimated)
+              current (reduce
+                        (fn [winner neighbor]
+                          (if (>= (System/nanoTime) deadline)
+                            (reduced winner)
+                            (let [candidate-score (score-queues neighbor estimated)]
+                              (if (neg? (compare candidate-score (:score winner)))
+                                {:queues neighbor :score candidate-score}
+                                winner))))
+                        {:queues best :score baseline}
+                        (neighbor-queues best specs))]
+          (if (neg? (compare (:score current) baseline))
+            (recur (:queues current) (inc iteration))
+            ;; A makespan-neutral rearrangement may temporarily worsen the
+            ;; secondary balance score but enable a better next move. Keep
+            ;; candidates whose makespan does not rise, with a modest bound.
+            (let [plateaus (->> (neighbor-queues best specs)
+                                (take-while (fn [_] (< (System/nanoTime) deadline)))
+                                (filter #(<= (first (score-queues % estimated))
+                                             (first baseline)))
+                                (sort-by #(score-queues % estimated))
+                                (take 96))
+                  better (reduce
+                           (fn [winner plateau]
+                             (reduce
+                               (fn [w neighbor]
+                                 (if (>= (System/nanoTime) deadline)
+                                   (reduced w)
+                                   (let [candidate-score (score-queues neighbor estimated)]
+                                     (if (neg? (compare candidate-score (:score w)))
+                                       {:queues neighbor :score candidate-score}
+                                       w))))
+                               winner
+                               (neighbor-queues plateau specs)))
+                           current plateaus)]
+              (if (neg? (compare (:score better) baseline))
+                (recur (:queues better) (inc iteration))
+                best))))))))
+
+(defn- previous-run-data [root]
+  ;; Only complete, validated historical results are inputs to a warm start.
+  ;; A broken/partial run must never prevent a fresh run from starting.
+  (let [runs (io/file root ".ygg" "runs")]
+    (some (fn [^java.io.File dir]
+            (when (and (.isDirectory dir) (not (Files/isSymbolicLink (.toPath dir)))
+                       (.isFile (io/file dir "jobs.edn"))
+                       (.isFile (io/file dir "schedule.edn")))
+              (try
+                (let [report (report-data! (.getPath dir))
+                      schedule (read-edn! (slurp (io/file dir "schedule.edn"))
+                                          "historical schedule")]
+                  (when (and (#{:pass :fail} (:overall report))
+                             (= schedule-format (:format schedule))
+                             (= 1 (:version schedule))
+                             (= (:inventory-sha256 report)
+                                (:inventory-sha256 schedule)))
+                    {:schedule schedule :report report}))
+                (catch Exception _ nil))))
+          (->> (or (.listFiles runs) [])
+               (sort-by #(.getName ^java.io.File %) #(compare %2 %1))))))
+
+(defn- prepare-schedule [root manifest specs]
+  (let [jobs (:jobs manifest)
+        previous (previous-run-data root)
+        observed (into {}
+                       (for [{:keys [id duration-ms]} (get-in previous [:report :jobs])
+                             :when (and (integer? duration-ms) (pos? duration-ms))]
+                         [id duration-ms]))
+        ;; Unknown jobs are conservatively treated as moderately expensive.
+        ;; Use actual observations from the latest complete run, not the old
+        ;; estimates that produced its planned allocation.
+        known (sort (vals observed))
+        default-ms (if (seq known)
+                     (max 1000 (nth known (quot (count known) 2)))
+                     60000)
+        estimated (into {} (for [{:keys [id]} jobs]
+                             [id (long (max 1 (get observed id default-ms)))]))
+        fresh (lpt-queues jobs specs estimated)
+        old-schedule (:schedule previous)
+        old-queues (:queues old-schedule)
+        warm? (and (= (count specs) (:worker-count old-schedule))
+                   (= (mapv :runtime specs) (:runtimes old-schedule))
+                   (valid-queues? old-queues specs jobs))
+        warm (when warm? old-queues)
+        initial (if (and warm
+                         (not (pos? (compare (score-queues warm estimated)
+                                             (score-queues fresh estimated)))))
+                  warm fresh)
+        origin (if (= initial warm) :warm-start :lpt)
+        improved (improve-queues initial specs estimated)]
+    {:format schedule-format :version 1
+     :inventory-sha256 (:inventory-sha256 manifest)
+     :worker-count (count specs)
+     :runtimes (mapv :runtime specs)
+     :queues improved
+     :estimated-ms estimated
+     :estimated-makespan-ms (first (score-queues improved estimated))
+     :origin origin}))
+
+(defn- write-schedule! [run schedule]
+  ;; Published before starting any workers, under the ordinary run directory.
+  (let [destination (io/file run "schedule.edn")]
+    (require! (not (.exists destination)) "Existing run schedule")
+    (spit destination (canonical-edn schedule))))
+
+(defn- schedule-for-worker! [run manifest runtime index]
+  (let [file (io/file run "schedule.edn")]
+    (require! (Files/isRegularFile (.toPath file)
+                                    (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+              "Worker schedule is absent or unsafe")
+    (let [schedule (read-edn! (slurp file) "run schedule")
+          ids (mapv :id (:jobs manifest))
+          queues (:queues schedule)]
+      (require! (and (= schedule-format (:format schedule))
+                     (= 1 (:version schedule))
+                     (= (:inventory-sha256 manifest)
+                        (:inventory-sha256 schedule))
+                     (integer? (:worker-count schedule))
+                     (= (:worker-count schedule) (count queues))
+                     (= (:worker-count schedule) (count (:runtimes schedule)))
+                     (= (set ids) (set (mapcat identity queues)))
+                     (= (count ids) (count (mapcat identity queues)))
+                     (every? vector? queues)
+                     (<= 1 index (:worker-count schedule))
+                     (= runtime (nth (:runtimes schedule) (dec index)))
+                     (every? true?
+                             (for [[runtime queue] (map vector (:runtimes schedule) queues)
+                                   id queue]
+                               (= runtime (:runtime
+                                           (first (filter #(= id (:id %)) (:jobs manifest))))))))
+                "Worker schedule does not match the immutable job inventory")
+      (let [own (nth queues (dec index))
+            all-other (->> (mapcat identity queues)
+                           (remove (set own))
+                           (filter (set (map :id (filter #(= runtime (:runtime %))
+                                                      (:jobs manifest)))))
+                           (sort-by (fn [id] [(- (get (:estimated-ms schedule) id 0)) id])))]
+        (vec (concat own all-other))))))
+
+;; Run orchestration is separate from work claiming. Shard provisions verified
+;; Ygg workspaces, publishes one immutable basket and a preferred stack plan,
+;; then launches pull-based workers. Plans never reserve or own jobs.
+(defn- command! [directory argv]
+  (let [r (apply shell/sh (concat argv [:dir (str directory)]))]
+    (require! (zero? (:exit r))
+              "External command failed"
+              {:command argv :exit (:exit r) :stderr (:err r) :stdout (:out r)})
+    (:out r)))
+
+(defn- real-directory! [f]
+  (require! (and (Files/isDirectory (.toPath (io/file f))
+                                    (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+                 (not (Files/isSymbolicLink (.toPath (io/file f)))))
+            "Missing or unsafe directory" {:path (str f)}))
+
+(defn- source-revision! [root]
+  (let [git-root (str/trim (command! root ["git" "rev-parse" "--show-toplevel"]))
+        head (str/trim (command! root ["git" "rev-parse" "HEAD"]))
+        dirty (command! root ["git" "status" "--porcelain=v1"
+                              "--untracked-files=all" "--" "." ":(exclude).ygg"
+                              ":(exclude).ygg.lock"])]
+    (require! (= (.getCanonicalPath (io/file root))
+                 (.getCanonicalPath (io/file git-root)))
+              "Run from the repository root, not a subdirectory")
+    (require! (re-matches #"[a-f0-9]{40,64}" head)
+              "Cannot identify a Git source commit")
+    (require! (str/blank? dirty)
+              "Repository has changes outside .ygg; commit before sharding"
+              {:changes (str/split-lines dirty)})
+    head))
+
+(defn- ensure-root-basket! [root]
+  (let [w (io/file root ".ygg")]
+    (when-not (.exists w)
+      (Files/createDirectory (.toPath w) no-attributes))
+    (real-directory! w)
+    ;; Until a project adds /.ygg/ to its root .gitignore, this local
+    ;; wildcard prevents `git add .` from accidentally staging mounted
+    ;; worker repositories or run logs.  Never overwrite a user file.
+    (let [ignore (io/file w ".gitignore")]
+      (when-not (.exists ignore)
+        (spit ignore "*\n"))
+      (require! (Files/isRegularFile (.toPath ignore)
+                                     (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+                "Unsafe .ygg/.gitignore"))
+    (let [runs (io/file w "runs")]
+      (when-not (.exists runs)
+        (Files/createDirectory (.toPath runs) no-attributes))
+      (real-directory! runs))))
+
+(defn- with-run-lock! [root callback]
+  (let [path (.toPath (io/file root ".ygg" ".shard-run.lock"))]
+    (require! (not (Files/isSymbolicLink path))
+              "Refusing symlink run lock")
+    (with-open [channel (FileChannel/open path
+                                          (into-array OpenOption
+                                                      [StandardOpenOption/CREATE
+                                                       StandardOpenOption/WRITE]))]
+      (let [lock (try (.tryLock channel) (catch Exception _ nil))]
+        (require! (some? lock) "Another Shard run is active")
+        ;; Closing the channel releases its OS lock, even if callback throws.
+        (callback)))))
+
+(defn- with-workers-lock! [root callback]
+  (let [path (.toPath (io/file root ".ygg" ".workers.lock"))]
+    (require! (not (Files/isSymbolicLink path))
+              "Refusing symlink Ygg worker lock")
+    (with-open [channel (FileChannel/open path
+                                          (into-array OpenOption
+                                                      [StandardOpenOption/CREATE
+                                                       StandardOpenOption/WRITE]))]
+      (let [lock (try (.tryLock channel) (catch Exception _ nil))]
+        (require! (some? lock)
+                  "Another process owns the Ygg workers")
+        (callback)))))
+
+(defn- ygg-status! [root]
+  (let [status (read-edn! (command! root ["ygg" "status" "--edn"])
+                          "Ygg verified status")]
+    (strict-keys! status
+                  #{:version :status :source-path :source-dataset
+                    :source-guid :run-id :snapshot :snapshot-guid :clones}
+                  "Ygg status")
+    (require! (= 1 (:version status)) "Unsupported Ygg status version")
+    (require! (= (str root) (:source-path status))
+              "Ygg verified a different source repository")
+    status))
+
+(defn- checked-clones! [root status n head]
+  (require! (and (= :ready (:status status))
+                 (= n (count (:clones status)))
+                 (string? (:snapshot-guid status))
+                 (not (str/blank? (:snapshot-guid status))))
+            "Ygg failed to verify all requested clones")
+  (doseq [[i c] (map-indexed vector (:clones status))]
+    (strict-keys! c #{:dataset :mountpoint :guid :mounted?} "Verified clone")
+    (let [expected (str (io/file root ".ygg" "workers" (str (inc i))))]
+      (require! (and (= expected (:mountpoint c))
+                     (true? (:mounted? c))
+                     (string? (:guid c))
+                     (not (str/blank? (:guid c))))
+                "Ygg returned an unexpected or unverified clone"
+                {:index i :clone c})
+      (real-directory! expected)
+      (require! (= head (str/trim
+                         (command! expected ["git" "rev-parse" "HEAD"])))
+                "Ygg clone does not contain the enumerated source revision"
+                {:workspace expected})))
+  (:clones status))
+
+(defn- default-inventory-command [root]
+  ;; New projects should expose a stable `bb test:inventory` task.  The existing
+  ;; Gesso v1067 transition uses a direct runner entrypoint until its bb.edn
+  ;; declares that task.  Never parse Gesso's implementation in Shard.
+  (let [bb-file (io/file root "bb.edn")
+        bb-data (when (.isFile bb-file)
+                  (read-edn! (slurp bb-file) "bb.edn"))
+        tasks (get bb-data :tasks)]
+    (cond
+      (or (contains? tasks 'test:inventory)
+          (contains? tasks :test:inventory)) ["bb" "test:inventory"]
+      (.isFile (io/file root "script/gesso_test.clj"))
+      ["bb" "script/gesso_test.clj" "inventory"]
+      :else (fail! "No project test inventory; supply --inventory COMMAND ARG ..."))))
+
+(defn- run-inventory! [root argv]
+  (require! (string-vector? argv) "Inventory command is invalid")
+  (let [data (read-edn! (command! root argv) "project inventory")]
+    (strict-keys! data #{:jobs :runtimes} "Project inventory")
+    (require! (vector? (:jobs data))
+              "Project inventory must supply a :jobs vector")
+    data))
+
+;; Backward-compatible adapter command, now consuming Gesso's actual EDN
+;; inventory rather than parsing the shape of run-all! and bb.edn. A harmless
+;; Gesso test-runner refactor must not break Shard's enumeration.
+(defn- gesso-inventory! [root-path]
+  (let [root (.getCanonicalFile (io/file root-path))]
+    (require! (.isFile (io/file root "script/gesso_test.clj"))
+              "No Gesso test runner at this project root")
+    (run-inventory! root ["bb" "script/gesso_test.clj" "inventory"])))
+
+(defn- inventory-manifest! [root head status inventory]
+  (let [jobs (:jobs inventory)
+        runtimes (or (:runtimes inventory)
+                     (into {}
+                           (for [[name js] (group-by :runtime jobs)]
+                             [name {:identity (str "git:" head
+                                                   ";zfs:" (:snapshot-guid status))
+                                    :capabilities (reduce set/union #{}
+                                                          (map :requires js))}])))
+        checked (validate-jobs! jobs (validate-runtimes! runtimes))
+        identity {:project-root (str root) :runtimes runtimes :jobs checked}]
+    {:format :shard/jobs :version 1 :created-at (str (Instant/now))
+     :inventory-sha256 (digest (canonical-edn identity))
+     :project-root (str root) :runtimes runtimes :jobs checked}))
+
+(defn- script-command! []
+  (let [path (System/getProperty "babashka.file")]
+    (require! (and (string? path) (not (str/blank? path)))
+              "Cannot locate running Shard executable")
+    (let [file (.getCanonicalFile (io/file path))]
+      (require! (.isFile file) "Shard script has disappeared")
+      (if (.canExecute file)
+        [(.getPath file)]
+        ["bb" (.getPath file)]))))
+
+(defn- start-worker! [command run workspace runtime index]
+  (let [log (io/file run (str "worker-" index ".log"))
+        argv (into command ["worker" (str run) (str workspace)
+                            (name runtime) "60000" (str index)])
+        b (ProcessBuilder. ^java.util.List argv)]
+    (.directory b (io/file workspace))
+    (.redirectErrorStream b true)
+    (.redirectOutput b (ProcessBuilder$Redirect/to log))
+    {:index index :log log :process (.start b)}))
+
+(defn- execute-workers! [run clones manifest]
+  (let [;; Exactly one test worker owns a writable clone at a time.
+        specs (worker-specs clones (:jobs manifest))
+        script (script-command!)
+        started (atom [])]
+    (try
+      (doseq [[i {:keys [workspace runtime]}] (map-indexed vector specs)]
+        (swap! started conj (start-worker! script run workspace runtime (inc i))))
+      (catch Exception ex
+        ;; Do not release the worker lock or clean clones with live children.
+        (doseq [{:keys [^Process process]} @started]
+          (.destroy process))
+        (doseq [{:keys [^Process process]} @started]
+          (when-not (.waitFor process 10 TimeUnit/SECONDS)
+            (.destroyForcibly process)))
+        (doseq [{:keys [^Process process]} @started]
+          (.waitFor process))
+        (fail! "Could not start every Shard worker; clones retained"
+               {:cause (.getMessage ex)})))
+    (let [exits (mapv (fn [{:keys [index log ^Process process]}]
+                        {:worker index :exit (.waitFor process) :log (str log)})
+                      @started)]
+      (doseq [{:keys [worker exit]} exits]
+        (println "SHARD WORKER EXIT" worker exit))
+      (flush)
+      (require! (every? #(zero? (:exit %)) exits)
+                "A Shard worker exited abnormally; clones retained"
+                {:workers exits})
+      exits)))
+
+(defn- parse-run-options! [argv]
+  (loop [args (vec argv) n nil]
+    (cond
+      (empty? args) (do (require! (some? n) "Usage: shard run --workers N [--inventory COMMAND ARG ...]")
+                        {:workers n})
+      (= "--workers" (first args))
+      (do (require! (and (nil? n) (second args))
+                    "Missing or duplicate --workers")
+          (let [parsed (try (Long/parseLong (second args))
+                            (catch Exception _ nil))]
+            (require! (and parsed (<= 1 parsed 256))
+                      "--workers must be 1..256")
+            (recur (subvec args 2) parsed)))
+      (= "--inventory" (first args))
+      (do (require! (some? n) "Supply --workers N before --inventory")
+          (let [cmd (vec (rest args))]
+            (require! (string-vector? cmd) "Missing inventory command")
+            {:workers n :inventory-command cmd}))
+      :else (fail! "Usage: shard run --workers N [--inventory COMMAND ARG ...]"))))
+
+(defn- run! [opts]
+  (let [root (.getCanonicalFile (io/file (System/getProperty "user.dir")))
+        _ (ensure-root-basket! root)]
+    (with-run-lock! root
+      (fn []
+        ;; Snapshot exactly the committed tree; .ygg is execution metadata.
+        (let [head (source-revision! root)
+              inventory (run-inventory! root
+                          (or (:inventory-command opts)
+                              (default-inventory-command root)))
+              previous (ygg-status! root)]
+          ;; Inventory discovery is not allowed to mutate source that will
+          ;; subsequently be snapshotted and executed by the workers.
+          (require! (= head (source-revision! root))
+                    "Project source changed during inventory enumeration")
+          (require! (= :idle (:status previous))
+                    "Existing Ygg clones must be cleaned before a new run"
+                    {:status (:status previous)})
+          (println "SHARD SOURCE" head)
+          (flush)
+          (command! root ["ygg" "-n" (str (:workers opts)) "create"])
+          ;; A concurrent external ygg clean can race between create and the
+          ;; lock acquisition. Verify again *inside* the worker lease.
+          (let [outcome
+                (with-workers-lock! root
+                  (fn []
+                    (let [status (ygg-status! root)
+                          clones (checked-clones! root status (:workers opts) head)
+                          manifest (inventory-manifest! root head status inventory)
+                          specs (worker-specs clones (:jobs manifest))
+                          schedule (prepare-schedule root manifest specs)
+                          run-name (str "run-" (:run-id status))
+                          run (io/file root ".ygg" "runs" run-name)]
+                      (publish! run manifest)
+                      (write-schedule! run schedule)
+                      (println "SHARD SCHEDULE" (name (:origin schedule))
+                               "estimated-ms" (:estimated-makespan-ms schedule))
+                      (spit (io/file run "source.edn")
+                            (canonical-edn {:format :shard/source :version 1
+                                            :git-head head
+                                            :ygg-run-id (:run-id status)
+                                            :ygg-snapshot (:snapshot status)
+                                            :inventory-sha256 (:inventory-sha256 manifest)
+                                            :clones clones}))
+                      (println "SHARD RUN" (.getPath run)
+                               "JOBS" (count (:jobs manifest)))
+                      (flush)
+                      (execute-workers! run clones manifest)
+                      (let [report (report-data! (.getPath run))]
+                        (print-report! report)
+                        (require! (not= :incomplete (:overall report))
+                                  "Run is incomplete; preserve clones and results"
+                                  {:run (str run)})
+                        {:run run :report report}))))]
+            ;; Every child has exited normally and every job has a terminal
+            ;; result, even when the suite FAILED. Only now is cleanup safe.
+            (command! root ["ygg" "clean"])
+            (println "SHARD CLEANED" (str (:run outcome)))
+            (flush)
+            (when-not (= :pass (get-in outcome [:report :overall]))
+              (System/exit 1))))))))
+
+(defn -main [& args]
+  (try
+    (case (first args)
+      "enumerate"
+      (let [[_ config-path run-dir & trailing] args]
+        (require! (and config-path run-dir (empty? trailing))
+                  "Usage: shard enumerate CONFIG.edn NEW-RUN-DIR")
+        (require! (.isFile (io/file config-path)) "Config file does not exist"
+                  {:config config-path})
+        (let [manifest (manifest! config-path)]
+          (publish! run-dir manifest)
+          (println "SHARD ENUMERATED" (count (:jobs manifest)) "jobs")
+          (println "Manifest:" (str (io/file run-dir "jobs.edn")))
+          (println "Inventory SHA-256:" (:inventory-sha256 manifest))))
+
+      "worker"
+      (let [[_ run-dir workspace runtime idle index & trailing] args]
+        (require! (and run-dir workspace runtime (empty? trailing))
+                  "Usage: shard worker RUN-DIR WORKSPACE-DIR RUNTIME [MAX-IDLE-MS] [STACK-INDEX]")
+        (let [idle-ms (if idle
+                        (try (Long/parseLong idle)
+                             (catch Exception _ (fail! "Invalid MAX-IDLE-MS")))
+                        60000)
+              stack-index (when index
+                            (try (Long/parseLong index)
+                                 (catch Exception _ (fail! "Invalid STACK-INDEX"))))]
+          (worker! run-dir workspace runtime idle-ms stack-index)))
+
+      "report"
+      (let [[_ run-dir format-option & trailing] args]
+        (require! (and run-dir (empty? trailing)
+                       (or (nil? format-option) (= "--edn" format-option)))
+                  "Usage: shard report RUN-DIR [--edn]")
+        (report! run-dir (= "--edn" format-option)))
+
+      "run"
+      (run! (parse-run-options! (rest args)))
+
+      "gesso-inventory"
+      (let [[_ project-root & trailing] args]
+        (require! (empty? trailing) "Usage: shard gesso-inventory [GESSO-ROOT]")
+        (print (canonical-edn (gesso-inventory! (or project-root "."))))
+        (flush))
+
+      (fail! "Usage: shard enumerate CONFIG.edn NEW-RUN-DIR | shard worker RUN-DIR WORKSPACE-DIR RUNTIME [MAX-IDLE-MS] | shard report RUN-DIR [--edn] | shard gesso-inventory [GESSO-ROOT] | shard run --workers N [--inventory COMMAND ARG ...]"))
+    (catch FileAlreadyExistsException _
+      (binding [*out* *err*] (println "Shard: destination already exists; refusing to overwrite"))
+      (System/exit 2))
+    (catch Exception ex
+      (binding [*out* *err*]
+        (println "Shard:" (.getMessage ex))
+        (when (ex-data ex) (println (pr-str (ex-data ex)))))
+      (System/exit 2))))
+
+(apply -main *command-line-args*)

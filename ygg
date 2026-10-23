@@ -1,0 +1,380 @@
+#!/usr/bin/env bb
+;; Ygg: conservative ZFS workspace clones for a repository at a dataset root.
+;; Usage: ygg [-n N] create | status [--edn] | clean [REPO]
+;; Clone mountpoints: REPO/.ygg/workers/1 ... N; run results: REPO/.ygg/runs/.
+;; Shard holds an exclusive FileChannel lock on .ygg/.workers.lock while using
+;; the clones. Ygg clean refuses to proceed while that lock is held.
+;; Ygg command serialization uses .ygg/.command.lock, never a root-level
+;; .ygg.lock. An existing legacy root lock requires explicit safe migration.
+;; Privileged ZFS operations always use sudo -n -- zfs (run sudo -v first).
+(require '[clojure.edn :as edn]
+         '[clojure.java.io :as io]
+         '[clojure.java.shell :as shell]
+         '[clojure.string :as str])
+(import '[java.nio.channels FileChannel]
+        '[java.nio.file Files LinkOption OpenOption StandardOpenOption]
+        '[java.time Instant ZoneId]
+        '[java.time.format DateTimeFormatter]
+        '[java.util UUID])
+
+(def ^:private state-file ".ygg-state.edn")
+(def ^:private no-follow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+(def ^:private safe-dataset #"[A-Za-z0-9][A-Za-z0-9_.:-]*(/[A-Za-z0-9][A-Za-z0-9_.:-]*)*")
+
+(defn- fail! [message & [data]] (throw (ex-info message (or data {}))))
+(defn- f [& xs] (apply io/file xs))
+(defn- canonical [value] (.getCanonicalPath (io/file value)))
+(defn- exists? [p] (Files/exists (.toPath (io/file p)) no-follow))
+(defn- symlink? [p] (Files/isSymbolicLink (.toPath (io/file p))))
+(defn- children [p]
+  (when (.isDirectory (io/file p))
+    (with-open [s (Files/list (.toPath (io/file p)))]
+      (vec (iterator-seq (.iterator s))))))
+(defn- read-edn [p]
+  (try (edn/read-string (slurp p))
+       (catch Exception e (fail! (str "Cannot read EDN: " p)
+                                 {:cause (.getMessage e)}))))
+
+;; The caller cannot select a privileged command or executable through EDN.
+(defn- execute! [privileged? args]
+  (let [command (concat (if privileged? ["sudo" "-n" "--" "zfs"] ["zfs"]) args)
+        result (apply shell/sh command)]
+    (when-not (zero? (:exit result))
+      (fail! (str "ZFS command failed: " (str/join " " command)
+                  "\n" (str/trim (or (:err result) "")))
+             {:exit (:exit result)}))
+    (str/trim (:out result))))
+(defn- zfs [& args] (execute! false args))
+(defn- sudo-zfs [& args] (execute! true args))
+(defn- probe-zfs [& args] (apply shell/sh (concat ["zfs"] args)))
+
+(defn- valid-dataset! [name]
+  (when-not (and (string? name) (re-matches safe-dataset name))
+    (fail! (str "Unsafe ZFS dataset name: " (pr-str name))))
+  name)
+(defn- source-dataset [root]
+  (let [rows (str/split-lines (zfs "list" "-H" "-t" "filesystem" "-o" "name,mountpoint"))
+        matching (for [row rows
+                       :let [[dataset point] (str/split row #"\t" 2)]
+                       :when (and point (str/starts-with? point "/")
+                                  (= root (canonical point)))]
+                   (valid-dataset! dataset))]
+    (when-not (= 1 (count matching))
+      (fail! (str "Repository root is not exactly one ZFS filesystem mountpoint: " root)))
+    (first matching)))
+(defn- property-value [dataset property]
+  (zfs "get" "-H" "-o" "value" property dataset))
+(defn- zfs-exists? [type name]
+  (let [r (probe-zfs "list" "-H" "-t" type "-o" "name" name)]
+    (cond
+      (zero? (:exit r)) (= name (str/trim (:out r)))
+      (re-find #"(?i)(does not exist|not found)" (or (:err r) "")) false
+      :else (fail! (str "Unable to determine ZFS existence: " name "\n" (:err r))))))
+
+(defn- workspace [root] (f root ".ygg"))
+(defn- worker-dir [root] (f (workspace root) "workers"))
+(defn- state-path [root] (f (workspace root) state-file))
+(defn- worker-lock-path [root] (f (workspace root) ".workers.lock"))
+(defn- command-lock-path [root] (f (workspace root) ".command.lock"))
+(defn- legacy-lock-path [root] (f root ".ygg.lock"))
+(defn- git-root! [root]
+  (when-not (exists? (f root ".git"))
+    (fail! (str "Missing Git repository at dataset root: " root))))
+(defn- ordinary-directory! [p]
+  (when (symlink? p) (fail! (str "Refusing symlink directory: " p)))
+  (when (and (exists? p) (not (.isDirectory (io/file p))))
+    (fail! (str "Not a directory: " p))))
+(defn- workspace-shape! [root]
+  (let [w (workspace root) workers (worker-dir root)]
+    (ordinary-directory! w)
+    (ordinary-directory! workers)
+    (ordinary-directory! (f w "runs"))
+    (when (symlink? (state-path root)) (fail! "Manifest may not be a symlink"))
+    (doseq [[label lock-path] [["Worker" (worker-lock-path root)]
+                               ["Command" (command-lock-path root)]]]
+      (when (symlink? lock-path)
+        (fail! (str label " lock may not be a symlink")))
+      (when (and (exists? lock-path) (not (.isFile lock-path)))
+        (fail! (str label " lock is not a regular file"))))))
+(defn- check-workspace! [root]
+  (workspace-shape! root)
+  (let [w (workspace root) workers (worker-dir root)]
+    (when (exists? (state-path root))
+      (fail! "Existing Ygg manifest; clean or recover first"))
+    (when (seq (children workers))
+      (fail! "Worker mountpoints are not empty; refusing create"))
+    (when-not (exists? w)
+      (when-not (.mkdir w) (fail! "Unable to create .ygg/")))
+    (when-not (exists? workers)
+      (when-not (.mkdir workers) (fail! "Unable to create .ygg/workers/")))))
+(defn- nested-zfs! [root source]
+  (doseq [row (str/split-lines (zfs "list" "-H" "-t" "filesystem" "-o" "name,mountpoint"))
+          :let [[name mp] (str/split row #"\t" 2)]
+          :when (and (not= name source) mp
+                     (str/starts-with? mp (str root "/")))]
+    (fail! (str "Nested ZFS filesystem must not be omitted from clone: " name " at " mp))))
+(defn- run-id []
+  (str (.format (DateTimeFormatter/ofPattern "yyyyMMdd-HHmmss")
+                (.atZone (Instant/now) (ZoneId/of "UTC")))
+       "-" (subs (str (UUID/randomUUID)) 0 8)))
+(defn- new-state [root source n]
+  (let [id (run-id)]
+    {:version 3 :source-dataset source :source-path root
+     :source-guid (property-value source "guid") :run-id id
+     :snapshot (str source "@ygg-" id) :snapshot-guid nil
+     :clones (mapv (fn [i] {:dataset (str source "/ygg-" id "-" i)
+                              :mountpoint (str (f (worker-dir root) (str i)))
+                              :guid nil})
+                   (range 1 (inc n)))}))
+(defn- write-state! [root state]
+  (let [dst (state-path root) temp (f (workspace root) ".ygg-state-writing")]
+    (when (or (symlink? dst) (exists? temp))
+      (fail! "Unsafe manifest target or abandoned manifest temporary file"))
+    (spit temp (str (pr-str state) "\n"))
+    (try
+      (Files/move (.toPath temp) (.toPath dst)
+                  (into-array java.nio.file.CopyOption
+                              [java.nio.file.StandardCopyOption/ATOMIC_MOVE
+                               java.nio.file.StandardCopyOption/REPLACE_EXISTING]))
+      (catch Exception e
+        (fail! (str "Cannot atomically write manifest: " (.getMessage e)))))))
+(defn- valid-manifest! [state root source]
+  (when-not (and (map? state) (= 3 (:version state))
+                 (= root (:source-path state))
+                 (= source (:source-dataset state))
+                 (re-matches safe-dataset source)
+                 (string? (:source-guid state))
+                 (re-matches #"[0-9]{8}-[0-9]{6}-[a-f0-9]{8}" (or (:run-id state) ""))
+                 (= (:snapshot state) (str source "@ygg-" (:run-id state)))
+                 (or (nil? (:snapshot-guid state)) (string? (:snapshot-guid state)))
+                 (vector? (:clones state)) (<= 1 (count (:clones state)) 256))
+    (fail! "Manifest does not describe this Ygg run and source dataset"))
+  (doseq [[idx clone] (map-indexed vector (:clones state))]
+    (when-not (and (map? clone)
+                   (= (:dataset clone) (str source "/ygg-" (:run-id state) "-" (inc idx)))
+                   (= (:mountpoint clone) (str (f (worker-dir root) (str (inc idx)))))
+                   (or (nil? (:guid clone)) (string? (:guid clone))))
+      (fail! "Manifest includes an unexpected clone target"))))
+(defn- source-unchanged! [state]
+  (when-not (= (:source-guid state) (property-value (:source-dataset state) "guid"))
+    (fail! "Source filesystem identity changed; refusing operation"))
+  (when-let [g (:snapshot-guid state)]
+    (when-not (and (zfs-exists? "snapshot" (:snapshot state))
+                   (= g (property-value (:snapshot state) "guid")))
+      (fail! "Origin snapshot identity changed; refusing operation"))))
+(defn- exact-clone! [state {:keys [dataset mountpoint guid]}]
+  (when-not (and (string? guid) (not (str/blank? guid))
+                 (zfs-exists? "filesystem" dataset)
+                 (= guid (property-value dataset "guid"))
+                 (= (:snapshot state) (property-value dataset "origin"))
+                 (= mountpoint (property-value dataset "mountpoint")))
+    (fail! (str "Refusing unverified clone: " dataset))))
+(defn- mounted-clone! [state clone]
+  (exact-clone! state clone)
+  (when-not (and (= "yes" (property-value (:dataset clone) "mounted"))
+                 (.isDirectory (io/file (:mountpoint clone)))
+                 (not (symlink? (:mountpoint clone))))
+    (fail! (str "Verified clone is not safely mounted: " (:dataset clone)))))
+(defn- no-dependents! [dataset]
+  ;; Deliberately never destroy recursively or force an unmount.
+  (let [desc (str/split-lines
+              (zfs "list" "-H" "-r" "-t" "filesystem,volume" "-o" "name" dataset))
+        snaps (remove str/blank? (str/split-lines
+               (zfs "list" "-H" "-r" "-t" "snapshot" "-o" "name" dataset)))]
+    (when-not (= [dataset] desc)
+      (fail! (str "Clone has child datasets; refusing destruction: " dataset)))
+    (when (seq snaps)
+      (fail! (str "Clone has snapshots; refusing destruction: " dataset)))))
+
+;; Every Shard run holds this same lock on the repository host while workers
+;; use their clones. Filesystem claims are NOT a substitute for this lease.
+;; A nonblocking FileChannel lock also makes ygg clean fail rather than wait.
+(defn- with-file-lock [p message work]
+  (when (symlink? p) (fail! (str "Refusing symlink lock: " p)))
+  (with-open [channel (FileChannel/open (.toPath (io/file p))
+                                        (into-array OpenOption
+                                                    [StandardOpenOption/CREATE
+                                                     StandardOpenOption/WRITE]))]
+    (let [lock (try (.tryLock channel)
+                    (catch Exception _ nil))]
+      (when-not lock (fail! message))
+      (work))))
+(defn- with-worker-idle [root work]
+  (workspace-shape! root)
+  (let [p (workspace root)]
+    (do (when-not (exists? p)
+          (when-not (.mkdir p) (fail! "Unable to create .ygg/")))
+        (with-file-lock (worker-lock-path root)
+          "Shard or another worker holds .ygg/.workers.lock; refusing ZFS mutation"
+          work))))
+(defn- create! [root source n]
+  (git-root! root)
+  (nested-zfs! root source)
+  (check-workspace! root)
+  ;; `.ygg/runs/` may hold previous results. It is ordinary data and is
+  ;; consequently included in a snapshot of the parent dataset. Workers are
+  ;; distinct mounted filesystems; ZFS does not recursively snapshot them.
+  (let [initial (new-state root source n)
+        snapshot (:snapshot initial)]
+    ;; The source snapshot is intentionally retained after clean.
+    (println "Create source snapshot:" snapshot)
+    (sudo-zfs "snapshot" snapshot)
+    (let [state (atom (assoc initial :snapshot-guid (property-value snapshot "guid")))]
+      (write-state! root @state)
+      (doseq [[idx {:keys [dataset mountpoint]}] (map-indexed vector (:clones @state))]
+        (println "Create clone:" dataset "->" mountpoint)
+        ;; -u prevents implicit mounts before identity is recorded and checked.
+        (sudo-zfs "clone" "-u" "-o" (str "mountpoint=" mountpoint) snapshot dataset)
+        (let [guid (property-value dataset "guid")]
+          (swap! state assoc-in [:clones idx :guid] guid)
+          (write-state! root @state))
+        (exact-clone! @state (get-in @state [:clones idx]))
+        (sudo-zfs "mount" dataset)
+        (mounted-clone! @state (get-in @state [:clones idx])))
+      (println "Created" n "clones under" (str (worker-dir root)))
+      (println "Original snapshot retained:" snapshot))))
+(defn- clean! [root source]
+  (let [p (workspace root) sf (state-path root)]
+    (workspace-shape! root)
+    (if-not (exists? sf)
+      (if (seq (children (worker-dir root)))
+        (fail! "Worker mountpoints without manifest; refusing cleanup")
+        (println "No recorded Ygg run"))
+      (let [state (read-edn sf)]
+        (valid-manifest! state root source)
+        (source-unchanged! state)
+        ;; Verify all existing clones before any destructive operation.
+        (doseq [clone (:clones state)
+                :when (zfs-exists? "filesystem" (:dataset clone))]
+          (exact-clone! state clone)
+          (no-dependents! (:dataset clone)))
+        (doseq [{:keys [dataset mountpoint] :as clone} (reverse (:clones state))
+                :when (zfs-exists? "filesystem" dataset)]
+          (exact-clone! state clone)
+          (when (= "yes" (property-value dataset "mounted"))
+            (println "Unmount verified clone:" dataset)
+            (sudo-zfs "unmount" dataset))
+          (exact-clone! state clone)
+          (no-dependents! dataset)
+          (when (= "yes" (property-value dataset "mounted"))
+            (fail! (str "Clone is still mounted: " dataset)))
+          (println "Destroy verified clone:" dataset)
+          (sudo-zfs "destroy" dataset)
+          (when (and (not (symlink? mountpoint))
+                     (.isDirectory (io/file mountpoint))
+                     (empty? (children mountpoint)))
+            (.delete (io/file mountpoint))))
+        (when-not (.delete sf) (fail! "Could not remove Ygg manifest"))
+        (println "Cleaned clones; original snapshot retained:" (:snapshot state))))))
+(defn- verified-state! [root source]
+  (workspace-shape! root)
+  (let [sf (state-path root)]
+    (if-not (exists? sf)
+      (do (when (seq (children (worker-dir root)))
+            (fail! "Orphan worker mountpoints without a manifest"))
+          {:version 1 :status :idle :source-path root
+           :source-dataset source :clones []})
+      (let [state (read-edn sf)]
+        (valid-manifest! state root source)
+        (source-unchanged! state)
+        (when-not (and (string? (:snapshot-guid state))
+                       (not (str/blank? (:snapshot-guid state))))
+          (fail! "Snapshot creation incomplete; refusing verified status"))
+        (doseq [clone (:clones state)] (mounted-clone! state clone))
+        {:version 1 :status :ready :source-path root
+         :source-dataset source :source-guid (:source-guid state)
+         :run-id (:run-id state) :snapshot (:snapshot state)
+         :snapshot-guid (:snapshot-guid state)
+         :clones (mapv (fn [{:keys [dataset mountpoint guid]}]
+                         {:dataset dataset :mountpoint mountpoint :guid guid
+                          :mounted? true})
+                       (:clones state))}))))
+(defn- status! [root source as-edn?]
+  (let [status (verified-state! root source)]
+    (if as-edn?
+      (println (pr-str status))
+      (if (= :idle (:status status))
+        (println "No recorded Ygg run")
+        (do (println "Origin snapshot:" (:snapshot status) "(retained on clean)")
+            (doseq [clone (:clones status)]
+              (println (:dataset clone) "->" (:mountpoint clone) "[verified mounted]")))))))
+(defn- parse-args [argv]
+  (loop [xs (seq argv) parsed {}]
+    (if (empty? xs)
+      parsed
+      (let [x (first xs)]
+        (cond
+          (= "-n" x)
+          (do (when (or (not (second xs)) (:n parsed)) (fail! "Invalid or duplicate -n"))
+              (let [n (try (Long/parseLong (second xs))
+                           (catch Exception _ (fail! "-n must be integer")))]
+                (when-not (<= 1 n 256) (fail! "-n must be 1 through 256"))
+                (recur (nnext xs) (assoc parsed :n n))))
+          (= "--edn" x)
+          (do (when (:edn? parsed) (fail! "Duplicate --edn"))
+              (recur (next xs) (assoc parsed :edn? true)))
+          (#{"create" "clean" "status"} x)
+          (do (when (:action parsed) (fail! "Multiple actions"))
+              (recur (next xs) (assoc parsed :action (keyword x))))
+          (str/starts-with? x "-") (fail! (str "Unrecognized option: " x))
+          (:root parsed) (fail! "Multiple paths supplied")
+          :else (recur (next xs) (assoc parsed :root x)))))))
+(defn- legacy-lock-absent! [root]
+  ;; Earlier Ygg versions serialize commands on a DIFFERENT inode. Using the
+  ;; new lock while that inode exists could permit mixed-version mutations.
+  ;; Do not unlink it: an older process may still hold a lock on that inode.
+  ;; The operator must retire all old Ygg processes before removing the file.
+  (when (exists? (legacy-lock-path root))
+    (fail! (str "Legacy .ygg.lock exists at " (legacy-lock-path root)
+                "; refusing mixed-version Ygg operation. Stop all older Ygg "
+                "commands and verify none are running before manually "
+                "removing that legacy file."))))
+(defn- ensure-command-lock-directory! [root]
+  (workspace-shape! root)
+  (let [w (workspace root)]
+    (when-not (exists? w)
+      ;; Concurrent starters may both observe the absent directory. Losing
+      ;; this mkdir race is safe; the persistent file lock arbitrates work.
+      (when-not (or (.mkdir w) (and (exists? w) (.isDirectory w)))
+        (fail! "Unable to create .ygg/ for command lock")))
+    (workspace-shape! root)))
+(defn- with-lock [root work]
+  ;; Preserve the lock inode across invocations. Never delete the lock file.
+  ;; A legacy lock is a migration blocker, not evidence that it is unlocked.
+  (legacy-lock-absent! root)
+  (ensure-command-lock-directory! root)
+  (with-file-lock (command-lock-path root)
+    "Another Ygg command is running for this repository"
+    (fn []
+      (legacy-lock-absent! root)
+      (work))))
+(defn -main [& argv]
+  (let [cli (parse-args argv)
+        root (canonical (or (:root cli) (System/getProperty "user.dir")))
+        config (let [p (f root "ygg.edn")]
+                 (if (.isFile p) (read-edn p) {}))
+        _ (when-not (map? config) (fail! "ygg.edn must contain a map"))
+        _ (when (contains? config :zfs-command)
+            (fail! ":zfs-command is no longer configurable for privileged safety"))
+        action (or (:action cli) (:action config))
+        n (or (:n cli) (:n config) 1)]
+    (when-not (.isDirectory (io/file root)) (fail! "Not a directory"))
+    (when-not (#{:create :clean :status} action)
+      (fail! "Specify create, clean, status or :action in ygg.edn"))
+    (when-not (and (integer? n) (<= 1 n 256))
+      (fail! "Clone count must be 1..256"))
+    (when (and (:edn? cli) (not= action :status))
+      (fail! "--edn is supported only for status"))
+    (let [source (source-dataset root)]
+      (with-lock root #(case action
+                         :create (with-worker-idle root (fn [] (create! root source n)))
+                         :clean (with-worker-idle root (fn [] (clean! root source)))
+                         :status (status! root source (:edn? cli)))))))
+(try
+  (apply -main *command-line-args*)
+  (catch Exception e
+    (binding [*out* *err*]
+      (println "ygg:" (.getMessage e))
+      (when-let [d (ex-data e)]
+        (when (:cause d) (println (:cause d)))))
+    (System/exit 1)))
