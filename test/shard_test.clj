@@ -385,6 +385,147 @@ else:
         (is (str/includes? (:out r) "changes outside .ygg"))
         (is (not (exists? (file (:project fx) ".ygg" "fake-workers"))))))))
 
+;; The regression cases below deliberately set a short MAX-IDLE-MS (rather
+;; than sleeping for the production default of 60 seconds). The worker must
+;; decide whether unfinished work can make progress, not simply time out.
+(defn- enumerate-runtimes!
+  [fx jobs]
+  (let [config (file (:base fx) "config.edn")]
+    (spit config
+          (pr-str {:version 1
+                   :project-root (.getCanonicalPath (:project fx))
+                   :runtimes {:jvm {:identity "jvm-test" :capabilities #{}}
+                              :node {:identity "node-test" :capabilities #{}}}
+                   :jobs jobs}))
+    (let [result (invoke fx "enumerate" (str config) (str (:run fx)))]
+      (is (= 0 (:exit result)) (str "enumerate failed: " (:out result)))
+      result)))
+
+(defn- runtime-worker
+  [fx workspace runtime idle-ms]
+  (exec! (:project fx)
+         [(:bb fx) (:shard fx) "worker" (str (:run fx))
+          (str workspace) (name runtime) (str idle-ms)]
+         {} 12000))
+
+(defn- await-file!
+  "Bounded synchronization with the prerequisite process; no timing guess."
+  [path max-ms]
+  (let [deadline (+ (System/nanoTime) (* 1000000 max-ms))]
+    (loop []
+      (if (exists? path)
+        true
+        (if (< (System/nanoTime) deadline)
+          (do (Thread/sleep 15) (recur))
+          false)))))
+
+(defn- lifecycle-jobs
+  [parent-command child-command]
+  [(assoc (job "parent" parent-command) :timeout-ms 4000)
+   (assoc (job "dependent" child-command ["parent"])
+          :runtime :node :timeout-ms 4000)])
+
+(deftest long-running-cross-runtime-prerequisite-does-not-retire-dependent-worker
+  (with-fixture
+    (fn [fx]
+      (let [node-workspace (file (:base fx) "node-workspace")
+            marker (file (:workspace fx) "parent-started")]
+        (.mkdirs node-workspace)
+        (enumerate-runtimes!
+          fx (lifecycle-jobs
+               ["bash" "-c" "touch parent-started; sleep 0.85; echo completed"]
+               ["bash" "-c" "echo child-completed"] ))
+        (let [parent (future (runtime-worker fx (:workspace fx) :jvm 100))]
+          (is (await-file! marker 4000)
+              "The JVM prerequisite must have started before the Node worker")
+          (let [dependent (runtime-worker fx node-workspace :node 100)
+                parent-result (deref parent 10000 ::deadline)
+                outcomes (into {} (map (fn [[_ r]] [(:id r) r]) (results fx)))
+                summary (report fx)]
+            (is (map? parent-result) (pr-str parent-result))
+            (is (= 0 (:exit parent-result)) (pr-str parent-result))
+            (is (= 0 (:exit dependent)) (:out dependent))
+            (is (str/includes? (:out dependent) "SHARD JOB dependent passed")
+                (:out dependent))
+            (is (not (str/includes? (:out dependent) "SHARD WORKER IDLE")))
+            (is (= :passed (get-in outcomes ["parent" :status])))
+            (is (= :passed (get-in outcomes ["dependent" :status])))
+            (is (= 0 (:exit summary)) (:out summary))
+            (is (= :pass (get-in summary [:edn :overall])))))))))
+
+(deftest failed-cross-runtime-prerequisite-is-blocked-after-long-wait
+  (with-fixture
+    (fn [fx]
+      (let [node-workspace (file (:base fx) "node-workspace")
+            marker (file (:workspace fx) "parent-started")
+            forbidden (file node-workspace "dependent-should-not-run")]
+        (.mkdirs node-workspace)
+        (enumerate-runtimes!
+          fx (lifecycle-jobs
+               ["bash" "-c" "touch parent-started; sleep 0.75; exit 23"]
+               ["bash" "-c" "touch dependent-should-not-run"] ))
+        (let [parent (future (runtime-worker fx (:workspace fx) :jvm 100))]
+          (is (await-file! marker 4000)
+              "The failing prerequisite must be running before the Node worker")
+          (let [dependent (runtime-worker fx node-workspace :node 100)
+                parent-result (deref parent 10000 ::deadline)
+                outcomes (into {} (map (fn [[_ r]] [(:id r) r]) (results fx)))
+                summary (report fx)]
+            (is (= 0 (:exit parent-result)) (pr-str parent-result))
+            (is (= 0 (:exit dependent)) (:out dependent))
+            (is (= :failed (get-in outcomes ["parent" :status])))
+            (is (= 23 (get-in outcomes ["parent" :exit-code])))
+            (is (= :blocked (get-in outcomes ["dependent" :status])))
+            (is (= ["parent"] (get-in outcomes ["dependent" :blocked-by])))
+            (is (not (exists? forbidden))
+                "A blocked dependent must never execute its command")
+            (is (str/includes? (:out dependent) "SHARD JOB dependent blocked"))
+            (is (= 1 (:exit summary)) (:out summary))
+            (is (= :fail (get-in summary [:edn :overall])))))))))
+
+(deftest stale-abandoned-prerequisite-does-not-hold-idle-worker-indefinitely
+  (with-fixture
+    (fn [fx]
+      (let [node-workspace (file (:base fx) "node-workspace")
+            marker (file node-workspace "should-not-run")]
+        (.mkdirs node-workspace)
+        (enumerate-runtimes!
+          fx (lifecycle-jobs
+               ["bash" "-c" "true"]
+               ["bash" "-c" "touch should-not-run"]))
+        (let [claim (file (:run fx) "claims" "parent")]
+          (is (.mkdir claim))
+          (Files/setLastModifiedTime (.toPath claim)
+                                     (java.nio.file.attribute.FileTime/fromMillis
+                                       (- (System/currentTimeMillis) 20000)))
+          (let [dependent (runtime-worker fx node-workspace :node 120)
+                summary (report fx)]
+            (is (= 0 (:exit dependent)) (:out dependent))
+            (is (str/includes? (:out dependent) "SHARD WORKER IDLE")
+                (:out dependent))
+            (is (not (exists? marker)))
+            (is (not (exists? (file (:run fx) "claims" "dependent"))))
+            (is (= 1 (:exit summary)) (:out summary))
+            (is (= :incomplete (get-in summary [:edn :overall])))
+            (is (= 1 (get-in summary [:edn :counts :claimed-without-result])))
+            (is (= 0 (get-in summary [:edn :counts :passed])))))))))
+
+(deftest fully-claimed-work-lets-another-worker-retire-without-stealing
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx [(job "claimed" ["bash" "-c" "touch should-not-run"])])
+      (is (.mkdir (file (:run fx) "claims" "claimed")))
+      (let [r (invoke fx "worker" (str (:run fx))
+                      (str (:workspace fx)) "jvm" "5000")
+            summary (report fx)]
+        (is (= 0 (:exit r)) (:out r))
+        (is (str/includes? (:out r) "SHARD WORKER DRAINED") (:out r))
+        (is (not (exists? (file (:workspace fx) "should-not-run"))))
+        (is (not (exists? (file (:run fx) "results" "claimed.edn"))))
+        (is (= 1 (:exit summary)) (:out summary))
+        (is (= :incomplete (get-in summary [:edn :overall])))
+        (is (= 1 (get-in summary [:edn :counts :claimed-without-result])))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
