@@ -278,24 +278,46 @@
     (zero? (.exitValue p))))
 
 (defn- live-in-group? [group-pid]
-  ;; Linux may retain zombie processes in a group after its members have
-  ;; terminated. `kill -0 -PGID` reports zombies as present, so check the
-  ;; actual /proc state and distinguish them from still-running processes.
+  ;; Procfs stat files have no reliable length. Babashka's clojure.core/slurp
+  ;; may fail with EINVAL for /proc/<pid>/stat even when that PID is alive.
+  ;; A failed probe must NEVER mean "no descendants": false negatives here
+  ;; could authorize destruction of a still-in-use ZFS clone.
   (let [proc (io/file "/proc")]
-    (require! (.isDirectory proc) "Linux /proc is required for timeout verification")
-    (boolean
-      (some (fn [^java.io.File entry]
-              (when (re-matches #"[0-9]+" (.getName entry))
-                (try
-                  (let [stat (slurp (io/file entry "stat"))
-                        i (.lastIndexOf stat ")")
-                        fields (str/split (subs stat (+ i 2)) #"\s+")
-                        state (nth fields 0)
-                        group (Long/parseLong (nth fields 2))]
-                    (and (= group group-pid) (not= state "Z") (not= state "X")))
-                  (catch java.io.IOException _ false)
-                  (catch java.lang.NumberFormatException _ false))))
-            (.listFiles proc)))))
+    (require! (.isDirectory proc) "Linux /proc is required for process verification")
+    (let [entries (.listFiles proc)]
+      (require! (some? entries) "Cannot enumerate Linux /proc; clones retained")
+      (boolean
+        (some (fn [^java.io.File entry]
+                (when (re-matches #"[0-9]+" (.getName entry))
+                  (let [stat-file (.toPath (io/file entry "stat"))]
+                    (try
+                      ;; Files/readString handles procfs pseudo-files correctly.
+                      (let [stat (Files/readString stat-file)
+                            i (.lastIndexOf stat ")")]
+                        (require! (not (neg? i))
+                                  "Malformed Linux process status; clones retained"
+                                  {:pid (.getName entry)})
+                        (let [fields (str/split (subs stat (+ i 2)) #"\s+")]
+                          (require! (>= (count fields) 3)
+                                    "Malformed Linux process fields; clones retained"
+                                    {:pid (.getName entry)})
+                          (let [state (nth fields 0)
+                                group (Long/parseLong (nth fields 2))]
+                            (and (= group group-pid)
+                                 (not= state "Z") (not= state "X")))))
+                      (catch java.nio.file.NoSuchFileException _ false)
+                      (catch java.io.IOException ex
+                        ;; PID may disappear between enumeration and reading.
+                        ;; Other read failures make cleanup unsafe.
+                        (if (Files/exists stat-file (make-array LinkOption 0))
+                          (fail! "Cannot read Linux process status; clones retained"
+                                 {:pid (.getName entry)
+                                  :cause (.getMessage ex)})
+                          false))
+                      (catch NumberFormatException _
+                        (fail! "Malformed Linux process group; clones retained"
+                               {:pid (.getName entry)}))))))
+              entries)))))
 
 (defn- terminate-group! [^Process p]
   (let [pid (.pid p)]
