@@ -2,12 +2,11 @@
   "Black-box regression tests of Ygg's standalone ZFS lifecycle.
 
    The test suite executes the actual root-level `ygg` executable against a
-   disposable source repository and a fake ZFS command, never the host's ZFS.
-   The fake is bundled here so the repository needs no external test fixture.
+   disposable source repository and a lightweight, filesystem-backed fake ZFS command, never the host's ZFS.
+   The Bash fake is bundled here and launches no Python interpreter.
    Live ZFS smoke testing remains a separate requirement. The v1074
    command-lock tests exercise the real cross-process FileChannel lock."
-  (:require [cheshire.core :as json]
-            [clojure.edn :as edn]
+  (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.java.shell :as sh]
             [clojure.string :as str]
@@ -17,112 +16,7 @@
            [java.nio.file.attribute BasicFileAttributes FileAttribute]))
 
 (def ^:private fake-zfs-source
-  "#!/usr/bin/env python3
-# Simulated ZFS command for Ygg lifecycle tests. Never touches real ZFS.
-import json
-import os
-import pathlib
-import sys
-
-path = pathlib.Path(os.environ['YGG_MOCK_STATE'])
-state = json.loads(path.read_text())
-objects = state['objects']
-args = sys.argv[1:]
-state.setdefault('calls', []).append(args)
-
-def save():
-    temp = path.with_suffix('.writing')
-    temp.write_text(json.dumps(state, sort_keys=True))
-    temp.replace(path)
-
-def ok(value=''):
-    save()
-    if value:
-        print(value)
-    sys.exit(0)
-
-def no(message='dataset does not exist'):
-    save()
-    print(message, file=sys.stderr)
-    sys.exit(1)
-
-def descendants(name):
-    return [key for key in objects if key == name or key.startswith(name + '/')]
-
-if not args:
-    no('missing command')
-command = args[0]
-if command == 'list':
-    kind = args[args.index('-t') + 1]
-    fields = args[args.index('-o') + 1]
-    recursive = '-r' in args
-    name = args[-1] if args[-1] not in ('name', 'name,mountpoint') else None
-    matches = [key for key in objects if ('@' in key) == (kind == 'snapshot')]
-    if name:
-        if recursive:
-            if kind == 'snapshot':
-                matches = [key for key in matches if key.startswith(name + '@') or key.startswith(name + '/')]
-            else:
-                matches = [key for key in matches if key == name or key.startswith(name + '/')]
-        else:
-            matches = [key for key in matches if key == name]
-        if not matches and not recursive:
-            no()
-    if fields == 'name,mountpoint':
-        ok('\\n'.join(key + '\\t' + objects[key].get('mountpoint', '-') for key in matches))
-    ok('\\n'.join(matches))
-if command == 'get':
-    name = args[-1]
-    prop = args[-2]
-    if name not in objects:
-        no()
-    if (state.get('fail_once') == 'clone-guid'
-            and prop == 'guid' and '/ygg-' in name and '@' not in name):
-        state['fail_once'] = None
-        no('injected clone GUID read failure')
-    ok(str(objects[name].get(prop, '-')))
-if command == 'snapshot':
-    name = args[1]
-    if name in objects:
-        no('already exists')
-    objects[name] = {'guid': 'snapshot-' + str(state.get('sequence', 1))}
-    state['sequence'] = state.get('sequence', 1) + 1
-    ok()
-if command == 'clone':
-    snapshot, name = args[-2:]
-    mountpoint = next((x.partition('=')[2] for x in args if x.startswith('mountpoint=')), None)
-    if not snapshot in objects or not mountpoint or name in objects:
-        no('invalid clone')
-    objects[name] = {'guid': 'clone-' + str(state.get('sequence', 1)),
-                     'origin': snapshot, 'mountpoint': mountpoint, 'mounted': 'no'}
-    state['sequence'] = state.get('sequence', 1) + 1
-    ok()
-if command == 'mount':
-    name = args[1]
-    if state.get('fail_once') == 'mount':
-        state['fail_once'] = None
-        no('injected mount failure')
-    if name not in objects:
-        no()
-    pathlib.Path(objects[name]['mountpoint']).mkdir(parents=True, exist_ok=True)
-    objects[name]['mounted'] = 'yes'
-    ok()
-if command == 'unmount':
-    name = args[1]
-    if name not in objects:
-        no()
-    objects[name]['mounted'] = 'no'
-    ok()
-if command == 'destroy':
-    if any(option in args for option in ('-r', '-R', '-f')):
-        no('destructive recursive option forbidden')
-    name = args[-1]
-    if name not in objects:
-        no()
-    del objects[name]
-    ok()
-no('unsupported fake ZFS operation: ' + repr(args))
-")
+  "#!/usr/bin/env bash\n# Filesystem-backed mock ZFS. One lightweight shell per command, no Python or ZFS.\nset -euo pipefail\nroot=${YGG_MOCK_DIR:?}\nobjects=\"$root/objects\"\nprintf '%s' \"$1\" >> \"$root/calls\"\nfor arg in \"${@:2}\"; do printf '\\t%s' \"$arg\" >> \"$root/calls\"; done\nprintf '\\n' >> \"$root/calls\"\nfail() { printf '%s\\n' \"${1:-dataset does not exist}\" >&2; exit 1; }\nencode() { file=\"$objects/${1//\\//!}\"; file=\"${file//@/\\~}\"; }\ndecode() { object=\"${1##*/}\"; object=\"${object//!//}\"; object=\"${object//\\~/@}\"; }\nread_object() {\n  encode \"$1\"\n  [[ -f \"$file\" ]] || fail\n  IFS='|' read -r guid origin mountpoint mounted < \"$file\" || true\n}\nwrite_object() { printf '%s|%s|%s|%s\\n' \"$guid\" \"$origin\" \"$mountpoint\" \"$mounted\" > \"$file\"; }\nnext_guid() {\n  local current\n  read -r current < \"$root/sequence\"\n  guid=\"${1}-${current}\"\n  printf '%s\\n' \"$((current + 1))\" > \"$root/sequence\"\n}\ncase \"$1\" in\n  list)\n    kind=filesystem; fields=name; recursive=0; target=''\n    shift\n    while (($#)); do\n      case \"$1\" in\n        -H) shift ;;\n        -r) recursive=1; shift ;;\n        -t) kind=$2; shift 2 ;;\n        -o) fields=$2; shift 2 ;;\n        *) target=$1; shift ;;\n      esac\n    done\n    found=0\n    shopt -s nullglob\n    for entry in \"$objects\"/*; do\n      decode \"$entry\"; dataset=$object\n      case \"$kind\" in\n        snapshot) [[ \"$dataset\" == *@* ]] || continue ;;\n        *) [[ \"$dataset\" != *@* ]] || continue ;;\n      esac\n      if [[ -n \"$target\" ]]; then\n        if ((recursive)); then\n          if [[ \"$kind\" == snapshot ]]; then\n            [[ \"$dataset\" == \"$target\"@* || \"$dataset\" == \"$target\"/* ]] || continue\n          else\n            [[ \"$dataset\" == \"$target\" || \"$dataset\" == \"$target\"/* ]] || continue\n          fi\n        else\n          [[ \"$dataset\" == \"$target\" ]] || continue\n        fi\n      fi\n      found=1\n      if [[ \"$fields\" == name,mountpoint ]]; then\n        IFS='|' read -r guid origin mountpoint mounted < \"$entry\" || true\n        printf '%s\\t%s\\n' \"$dataset\" \"$mountpoint\"\n      else\n        printf '%s\\n' \"$dataset\"\n      fi\n    done\n    if ((found == 0)) && [[ -n \"$target\" ]] && ((recursive == 0)); then fail; fi\n    ;;\n  get)\n    prop=${@: -2:1}; name=${@: -1}\n    read_object \"$name\"\n    if [[ \"$prop\" == guid && \"$name\" == */ygg-* && \"$name\" != *@* && -f \"$root/fail_once\" ]]; then\n      read -r failure < \"$root/fail_once\" || true\n      if [[ \"$failure\" == clone-guid ]]; then\n        rm -f \"$root/fail_once\"\n        fail 'injected clone GUID read failure'\n      fi\n    fi\n    case \"$prop\" in\n      guid) printf '%s\\n' \"$guid\" ;;\n      origin) printf '%s\\n' \"$origin\" ;;\n      mountpoint) printf '%s\\n' \"$mountpoint\" ;;\n      mounted) printf '%s\\n' \"$mounted\" ;;\n      *) printf -- '-\\n' ;;\n    esac\n    ;;\n  snapshot)\n    name=$2\n    encode \"$name\"\n    [[ ! -e \"$file\" ]] || fail 'already exists'\n    next_guid snapshot\n    origin=-; mountpoint=-; mounted=-\n    write_object\n    ;;\n  clone)\n    snapshot=${@: -2:1}; name=${@: -1}\n    read_object \"$snapshot\"\n    proposed=''\n    for arg in \"$@\"; do\n      if [[ \"$arg\" == mountpoint=* ]]; then proposed=${arg#mountpoint=}; fi\n    done\n    [[ -n \"$proposed\" ]] || fail 'invalid clone mountpoint'\n    encode \"$name\"\n    [[ ! -e \"$file\" ]] || fail 'already exists'\n    next_guid clone\n    origin=$snapshot; mountpoint=$proposed; mounted=no\n    write_object\n    ;;\n  mount|unmount)\n    action=$1; name=$2\n    if [[ \"$action\" == mount && -f \"$root/fail_once\" ]]; then\n      read -r failure < \"$root/fail_once\" || true\n      if [[ \"$failure\" == mount ]]; then\n        rm -f \"$root/fail_once\"\n        fail 'injected mount failure'\n      fi\n    fi\n    read_object \"$name\"\n    if [[ \"$action\" == mount ]]; then\n      mkdir -p \"$mountpoint\"\n      mounted=yes\n    else\n      mounted=no\n    fi\n    write_object\n    ;;\n  destroy)\n    for arg in \"$@\"; do\n      case \"$arg\" in -r|-R|-f) fail 'destructive recursive option forbidden' ;; esac\n    done\n    name=${@: -1}; read_object \"$name\"\n    rm -- \"$file\"\n    ;;\n  *) fail \"unsupported fake ZFS operation: $1\" ;;\nesac\n")
 
 (def ^:private no-follow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
 
@@ -151,15 +45,68 @@ no('unsupported fake ZFS operation: ' + repr(args))
                       {:expected (.getAbsolutePath p)})))
     (.getCanonicalPath p)))
 
+(defn- dataset-file [fx dataset]
+  (path (:state fx) "objects"
+        (-> (str dataset)
+            (str/replace "/" "!")
+            (str/replace "@" "~"))))
+
+(defn- read-object [entry]
+  (let [[guid origin mountpoint mounted]
+        (str/split (str/trim (slurp entry)) #"\|" -1)]
+    {:guid guid :origin origin :mountpoint mountpoint :mounted mounted}))
+
+(defn- mock-state [fx]
+  (let [objects-dir (path (:state fx) "objects")
+        obj (into {}
+                  (for [entry (or (seq (.listFiles objects-dir)) [])
+                        :when (.isFile entry)]
+                    [(-> (.getName entry)
+                         (str/replace "!" "/")
+                         (str/replace "~" "@"))
+                     (read-object entry)]))
+        calls-file (path (:state fx) "calls")
+        calls (if (exists? calls-file)
+                (mapv #(str/split % #"\t" -1)
+                      (str/split-lines (slurp calls-file)))
+                [])
+        failure-file (path (:state fx) "fail_once")]
+    {:objects obj
+     :calls calls
+     :sequence (Long/parseLong (str/trim (slurp (path (:state fx) "sequence"))))
+     :fail_once (when (exists? failure-file)
+                  (str/trim (slurp failure-file)))}))
+
+(defn- update-mock! [fx change]
+  (let [state (change (mock-state fx))
+        objects-dir (path (:state fx) "objects")]
+    (doseq [entry (or (seq (.listFiles objects-dir)) [])]
+      (Files/delete (.toPath entry)))
+    (doseq [[dataset props] (:objects state)]
+      (let [{:keys [guid origin mountpoint mounted]} props]
+        (spit (dataset-file fx dataset)
+              (str (or guid "-") "|" (or origin "-") "|"
+                   (or mountpoint "-") "|" (or mounted "-") "\n"))))
+    (spit (path (:state fx) "sequence") (str (:sequence state) "\n"))
+    (spit (path (:state fx) "calls")
+          (str (str/join "\n" (map #(str/join "\t" %) (:calls state)))
+               (when (seq (:calls state)) "\n")))
+    (let [f (path (:state fx) "fail_once")]
+      (if-let [failure (:fail_once state)]
+        (spit f (str failure "\n"))
+        (Files/deleteIfExists (.toPath f))))))
+
 (defn- make-fixture []
   (let [base (.toFile (Files/createTempDirectory "ygg-lifecycle-"
                                                 (make-array FileAttribute 0)))
         root (path base "source")
         fake-bin (path base "bin")
-        state (path base "mock-state.json")]
+        state (path base "mock-zfs")]
     (.mkdir root)
     (.mkdir (path root ".git"))
     (.mkdir fake-bin)
+    (.mkdir state)
+    (.mkdir (path state "objects"))
     (write-executable! (path fake-bin "zfs") fake-zfs-source)
     (write-executable! (path fake-bin "sudo")
                        (str "#!/bin/sh\n"
@@ -167,20 +114,16 @@ no('unsupported fake ZFS operation: ' + repr(args))
                             "[ \"$2\" = -- ] || exit 92\n"
                             "[ \"$3\" = zfs ] || exit 93\n"
                             "shift 2\nexec \"$@\"\n"))
-    (spit state (json/generate-string
-                 {:objects {"tank/fixture" {:guid "source-original"
-                                              :mountpoint (.getCanonicalPath root)
-                                              :mounted "yes"}}
-                  :sequence 1 :calls []}))
+    (spit (path state "sequence") "1\n")
+    (spit (path state "calls") "")
+    (spit (path state "objects" "tank!fixture")
+          (str "source-original|-|" (.getCanonicalPath root) "|yes\n"))
     {:base base :root root :bin fake-bin :state state
      :ygg (locate-ygg!)}))
 
-(defn- mock-state [fx] (json/parse-string (slurp (:state fx)) true))
-(defn- update-mock! [fx change]
-  (spit (:state fx) (json/generate-string (change (mock-state fx)))))
 (defn- run-ygg [fx & args]
   (let [environment (assoc (into {} (System/getenv))
-                           "YGG_MOCK_STATE" (.getAbsolutePath (:state fx))
+                           "YGG_MOCK_DIR" (.getAbsolutePath (:state fx))
                            "PATH" (str (.getAbsolutePath (:bin fx))
                                        java.io.File/pathSeparator
                                        (System/getenv "PATH")))
