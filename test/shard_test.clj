@@ -526,6 +526,136 @@ else:
         (is (= :incomplete (get-in summary [:edn :overall])))
         (is (= 1 (get-in summary [:edn :counts :claimed-without-result])))))))
 
+
+;; v1082: interruption and detached-descendant regressions for Shard v1081.
+;; Run commands through the public CLI. Never signal the test runner itself.
+(defn- start-cli!
+  [fx cwd args env]
+  (let [out (file (:base fx) (str "shard-live-" (java.util.UUID/randomUUID) ".log"))
+        builder (ProcessBuilder. ^java.util.List (vec args))]
+    (.directory builder (io/file cwd))
+    (.redirectErrorStream builder true)
+    (.redirectOutput builder (ProcessBuilder$Redirect/to out))
+    (doseq [[key value] env]
+      (.put (.environment builder) (name key) (str value)))
+    {:process (.start builder) :log out}))
+
+(defn- finish-cli!
+  [started timeout-ms]
+  (let [^Process process (:process started)
+        finished? (.waitFor process (long timeout-ms) TimeUnit/MILLISECONDS)]
+    (when-not finished?
+      (.destroyForcibly process)
+      (.waitFor process 5 TimeUnit/SECONDS))
+    {:exit (if finished? (.exitValue process) :test-subprocess-timeout)
+     :out (slurp (:log started))}))
+
+(defn- terminate-cli! [started]
+  (let [^Process p (:process started)]
+    (when (.isAlive p) (.destroy p))
+    (finish-cli! started 12000)))
+
+(deftest interrupted-worker-kills-its-test-session-and-descendants
+  (with-fixture
+    (fn [fx]
+      (let [marker (file (:workspace fx) "active-job-started")
+            escaped (file (:workspace fx) "escaped-after-termination")]
+        (enumerate! fx [(assoc (job "active"
+                                     ["bash" "-c"
+                                      "(sleep 1.6; touch escaped-after-termination) & touch active-job-started; wait"])
+                               :timeout-ms 8000)])
+        (let [started (start-cli! fx (:project fx)
+                                  [(:bb fx) (:shard fx) "worker"
+                                   (str (:run fx)) (str (:workspace fx)) "jvm" "100"]
+                                  {})]
+          (try
+            (is (await-file! marker 5000) "Wait for the active test to start")
+            (is (exists? (file (:run fx) "claims" "active" "session.edn"))
+                "The process-group identity is recorded while the job runs")
+            (let [terminated (terminate-cli! started)]
+              (is (not= :test-subprocess-timeout (:exit terminated)) (:out terminated)))
+            (Thread/sleep 1750)
+            (is (not (exists? escaped))
+                "SIGTERM must terminate the child in the detached test session")
+            (is (not (exists? (file (:run fx) "results" "active.edn")))
+                "Cancellation must never publish a successful test result")
+            (let [summary (report fx)]
+              (is (= 1 (:exit summary)) (:out summary))
+              (is (= :incomplete (get-in summary [:edn :overall]))))
+            (finally
+              (when (.isAlive ^Process (:process started))
+                (terminate-cli! started)))))))))
+
+(deftest successful-job-reaps-background-descendants-before-reporting-pass
+  (with-fixture
+    (fn [fx]
+      (let [escaped (file (:workspace fx) "escaped-after-success")]
+        (enumerate! fx [(job "detached"
+                             ["bash" "-c"
+                              "(sleep 1.3; touch escaped-after-success) >/dev/null 2>&1 & echo completed"])] )
+        (let [done (worker fx)
+              record (get (results fx) "detached.edn")]
+          (is (= 0 (:exit done)) (:out done))
+          (is (= :passed (:status record)) (pr-str record))
+          (is (exists? (file (:run fx) "claims" "detached" "session.edn")))
+          (Thread/sleep 1450)
+          (is (not (exists? escaped))
+              "A successful shell must not leave background processes writing to clones")
+          (is (= 0 (:exit (report fx)))))))))
+
+(deftest interrupted-supervisor-keeps-clones-and-stops-active-job
+  (with-fixture
+    (fn [fx]
+      (git-project! fx [(assoc (job "job0"
+                                     ["bash" "-c"
+                                      "(sleep 1.7; touch escaped-after-shutdown) & touch supervisor-job-started; wait"])
+                               :timeout-ms 9000)])
+      (let [env (ygg-shim! fx)
+            cmd [(:bb fx) (:shard fx) "run" "--workers" "1"
+                 "--inventory" (:bb fx) "inventory.clj"]
+            started (start-cli! fx (:project fx) cmd env)
+            clone (file (:project fx) ".ygg" "workers" "1")
+            marker (file clone "supervisor-job-started")]
+        (try
+          (is (await-file! marker 7000) "Wait until supervisor's test has started")
+          (let [terminated (terminate-cli! started)]
+            (is (not= :test-subprocess-timeout (:exit terminated)) (:out terminated)))
+          (is (exists? (file (:project fx) ".ygg" "fake-workers"))
+              "The supervisor must not clean Ygg clones after interruption")
+          (is (exists? clone) "The interrupted clone remains available")
+          (Thread/sleep 1850)
+          (is (not (exists? (file clone "escaped-after-shutdown")))
+              "SIGTERM must reach worker and the test descendant")
+          (let [run (file (:project fx) ".ygg" "runs" "run-fixed-mock-run")]
+            (is (exists? (file run "claims" "job0" "session.edn")))
+            (is (not (exists? (file run "results" "job0.edn")))
+                "An interrupted job cannot be represented as passed"))
+          (finally
+            (when (.isAlive ^Process (:process started))
+              (terminate-cli! started))))))))
+
+(deftest invalid-test-session-evidence-forbids-supervisor-cleanup
+  (with-fixture
+    (fn [fx]
+      ;; The job deliberately tampers with its own session record after the
+      ;; worker has created it. Supervisors must fail closed even if the
+      ;; command and every worker exit normally.
+      (git-project! fx [(job "job0"
+                             ["bash" "-c"
+                              "printf 'invalid-session-data' > ../../runs/run-fixed-mock-run/claims/job0/session.edn"])] )
+      (let [env (ygg-shim! fx)
+            cmd [(:bb fx) (:shard fx) "run" "--workers" "1"
+                 "--inventory" (:bb fx) "inventory.clj"]
+            done (exec! (:project fx) cmd env 45000)
+            run (file (:project fx) ".ygg" "runs" "run-fixed-mock-run")]
+        (is (= 2 (:exit done)) (:out done))
+        (is (str/includes? (:out done) "Invalid job-session record") (:out done))
+        (is (exists? (file (:project fx) ".ygg" "fake-workers"))
+            "Unsafe session evidence must prevent Ygg cleanup")
+        (is (exists? (file (:project fx) ".ygg" "workers" "1")))
+        (is (exists? (file run "results" "job0.edn"))
+            "A green worker result must not override a failed cleanup gate")))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
