@@ -13,7 +13,7 @@
          '[clojure.string :as str])
 (import '[java.nio.file Files FileAlreadyExistsException LinkOption
           StandardCopyOption Path]
-        '[java.nio.file.attribute FileAttribute]
+        '[java.nio.file.attribute FileAttribute PosixFilePermissions]
         '[java.security MessageDigest]
         '[java.io PushbackReader StringReader]
         '[java.nio.channels FileChannel]
@@ -387,7 +387,69 @@
            (try (.removeShutdownHook runtime hook)
                 (catch IllegalStateException _ nil))))))
 
-(defn- execute! [run job ^java.io.File workspace ^java.io.File logfile]
+;; Child test commands must not write into a shared host home or temporary
+;; directory. Each worker owns private writable paths within its ZFS clone.
+;; This is filesystem hygiene, not a sandbox: external services, sockets and
+;; explicitly configured absolute paths remain shared host resources.
+(def ^:private worker-env-no-follow
+  (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+(def ^:private worker-private-permissions
+  (PosixFilePermissions/fromString "rwx------"))
+(def ^:private worker-private-attributes
+  (into-array FileAttribute
+              [(PosixFilePermissions/asFileAttribute worker-private-permissions)]))
+
+(defn- worker-env-directory! [parent basename private?]
+  (let [path (.toPath (io/file parent basename))]
+    (try
+      (Files/createDirectory path (if private?
+                                    worker-private-attributes no-attributes))
+      (catch FileAlreadyExistsException _ nil))
+    (require! (Files/isDirectory path worker-env-no-follow)
+              "Unsafe worker environment directory (non-directory or symlink)"
+              {:path (str path)})
+    (when private?
+      (Files/setPosixFilePermissions path worker-private-permissions))
+    (.toFile path)))
+
+(defn- create-worker-environment! [^java.io.File workspace worker-id]
+  ;; Verify every parent without following symlinks. Do not reuse a previous
+  ;; worker's home, cache or temp tree, including after an interrupted run.
+  (let [root (worker-env-directory! workspace ".ygg" false)
+        base (worker-env-directory! root "shard-worker-env" true)
+        unique (worker-env-directory! base worker-id true)
+        home (worker-env-directory! unique "home" true)
+        tmp (worker-env-directory! unique "tmp" true)
+        cache (worker-env-directory! unique "cache" true)
+        config (worker-env-directory! unique "config" true)
+        data (worker-env-directory! unique "data" true)
+        state (worker-env-directory! unique "state" true)
+        path (fn [f] (.getAbsolutePath ^java.io.File f))]
+    {"SHARD_WORKER_ENV_ROOT" (path unique)
+     "SHARD_WORKER_TMP" (path tmp)
+     "HOME" (path home)
+     "TMPDIR" (path tmp)
+     "TMP" (path tmp)
+     "TEMP" (path tmp)
+     "XDG_CACHE_HOME" (path cache)
+     "XDG_CONFIG_HOME" (path config)
+     "XDG_DATA_HOME" (path data)
+     "XDG_STATE_HOME" (path state)}))
+
+(defn- java-tool-options-for-worker [existing tmp]
+  ;; JAVA_TOOL_OPTIONS reaches Java processes launched by shell scripts, Clojure
+  ;; CLI and other nested tools. Preserve the caller's other JVM options.
+  ;; Quoting protects paths containing spaces; newlines are unsafe in options.
+  (require! (not (re-find #"[\r\n]" tmp))
+            "Worker temp path cannot contain newlines")
+  (let [quoted (str "\"" (-> tmp
+                               (str/replace "\\" "\\\\")
+                               (str/replace "\"" "\\\"")) "\"")]
+    (str (when (and existing (not (str/blank? existing)))
+           (str existing " "))
+         "-Djava.io.tmpdir=" quoted)))
+
+(defn- execute! [run job ^java.io.File workspace ^java.io.File logfile worker-env]
   ;; Run every test in a distinct Linux process session. Record its PGID in
   ;; the run basket; neither a successful exit nor a supervisor signal proves
   ;; that detached descendants have stopped.
@@ -398,6 +460,10 @@
     (.directory builder workspace)
     (.redirectErrorStream builder true)
     (.redirectOutput builder (ProcessBuilder$Redirect/to logfile))
+    (.putAll env worker-env)
+    (.put env "JAVA_TOOL_OPTIONS"
+          (java-tool-options-for-worker (.get env "JAVA_TOOL_OPTIONS")
+                                        (get worker-env "TMPDIR")))
     (.put env "SHARD_JOB_ID" (:id job))
     (.put env "SHARD_WORKSPACE" (.getCanonicalPath workspace))
     (try
@@ -435,7 +501,7 @@
          :error (str (class ex) ": " (.getMessage ex))
          :duration-ms (long (/ (- (System/nanoTime) start) 1000000))}))))
 
-(defn- run-claimed-job! [run manifest workspace worker-id job blocked-reason]
+(defn- run-claimed-job! [run manifest workspace worker-env worker-id job blocked-reason]
   (let [id (:id job)
         logfile (io/file run "logs" (str id ".log"))
         start (Instant/now)
@@ -444,7 +510,7 @@
                                        (pr-str (sort blocked-reason)) "\n"))
                      {:status :blocked :exit-code nil :duration-ms 0
                       :blocked-by (vec (sort blocked-reason))})
-                 (execute! run job workspace logfile))]
+                 (execute! run job workspace logfile worker-env))]
     ;; A test terminated by the worker's signal handler is NOT an ordinary
     ;; failed/passed test. Leave its claim incomplete for manual recovery.
     (require! (not @worker-interrupted?)
@@ -498,6 +564,7 @@
         _ (require! (and (integer? max-idle) (<= 0 max-idle 86400000))
                     "MAX-IDLE-MS must be between 0 and 86400000")
         worker-id (str (UUID/randomUUID))
+        worker-env (create-worker-environment! workspace worker-id)
         allowed (filterv #(= runtime (:runtime %)) (:jobs manifest))
         preferred (when schedule-index
                     (schedule-for-worker! run manifest runtime schedule-index))
@@ -527,7 +594,7 @@
           decision
           (let [[job blocked-reason] decision]
             (if (atomic-claim! run (:id job))
-              (do (run-claimed-job! run manifest workspace worker-id job blocked-reason)
+              (do (run-claimed-job! run manifest workspace worker-env worker-id job blocked-reason)
                   (recur (System/currentTimeMillis)))
               (recur idle-start)))
 
