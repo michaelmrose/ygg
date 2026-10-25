@@ -677,7 +677,90 @@
               "Result has invalid execution error field" {:id id})
     result))
 
-(defn- report-data! [run-path]
+;; Gesso emits timing evidence as a standalone, single-line EDN value only
+;; after verifying a nonempty, successful JVM namespace execution.  Shard
+;; treats these values as observational performance data, never as a substitute
+;; for immutable job results or their exit-status validation.
+(def ^:private jvm-timing-keys
+  #{:gesso/jvm-timing :namespace :wall-ms :launch-to-testing-ms
+    :testing-to-summary-ms :summary-to-exit-ms :method})
+(def ^:private jvm-timing-fields
+  [:wall-ms :launch-to-testing-ms :testing-to-summary-ms
+   :summary-to-exit-ms])
+
+(defn- gesso-jvm-namespace-job? [job]
+  (= :gesso-jvm-namespace (get-in job [:unit :type])))
+
+(defn- valid-jvm-timing? [expected-ns entry]
+  (and (map? entry)
+       (= jvm-timing-keys (set (keys entry)))
+       (= 1 (:gesso/jvm-timing entry))
+       (= expected-ns (:namespace entry))
+       (= :stdout-milestones (:method entry))
+       (every? #(let [n (get entry %)] (and (integer? n) (<= 0 n)))
+               jvm-timing-fields)
+       (let [parts (+ (:launch-to-testing-ms entry)
+                      (:testing-to-summary-ms entry)
+                      (:summary-to-exit-ms entry))
+             wall (:wall-ms entry)]
+         ;; Each component is truncated to milliseconds independently; the
+         ;; whole interval may exceed their sum by at most two milliseconds.
+         (<= parts wall (+ parts 2)))))
+
+(defn- read-jvm-timing [run id expected-ns]
+  (let [log (io/file run "logs" (str id ".log"))]
+    (with-open [reader (io/reader log)]
+      (let [matches
+            (reduce (fn [matches line]
+                      (let [trimmed (str/trim line)]
+                        (if (str/starts-with? trimmed "{:gesso/jvm-timing")
+                          ;; Keep only the first two. A duplicate, even if
+                          ;; valid, must not be counted as one measurement.
+                          (if (< (count matches) 2)
+                            (conj matches
+                                  (if (<= (count trimmed) 2048)
+                                    (try (read-edn! trimmed (str "JVM timing for " id))
+                                         (catch Exception _ ::invalid))
+                                    ::invalid))
+                            matches)
+                          matches)))
+                    [] (line-seq reader))]
+        (cond
+          (empty? matches) {:status :missing}
+          (and (= 1 (count matches))
+               (valid-jvm-timing? expected-ns (first matches)))
+          {:status :measured :timing (first matches)}
+          :else {:status :invalid})))))
+
+(defn- jvm-timing-summary! [run jobs results]
+  (let [eligible (filterv (fn [job]
+                            (and (gesso-jvm-namespace-job? job)
+                                 (= :passed (:status (get results (:id job))))))
+                          jobs)
+        classified
+        (mapv (fn [job]
+                (assoc (read-jvm-timing run (:id job) (get-in job [:unit :name]))
+                       :id (:id job)))
+              eligible)
+        measurements
+        (mapv (fn [{:keys [id timing]}]
+                (assoc (select-keys timing jvm-timing-fields)
+                       :id id :namespace (:namespace timing)))
+              (filter #(= :measured (:status %)) classified))
+        sum-field (fn [k] (reduce + 0 (map #(get % k) measurements)))]
+    {:eligible (count eligible)
+     :measured (count measurements)
+     :missing (mapv :id (filter #(= :missing (:status %)) classified))
+     :invalid (mapv :id (filter #(= :invalid (:status %)) classified))
+     :totals-ms (into (sorted-map)
+                      (for [k jvm-timing-fields] [k (sum-field k)]))
+     :slowest (->> measurements
+                   (sort-by (juxt (comp - :wall-ms) :id))
+                   (take 10) vec)}))
+
+(defn- report-data!
+  ([run-path] (report-data! run-path true))
+  ([run-path include-timing?]
   (let [run (.getCanonicalFile (io/file run-path))
         manifest (read-manifest! run)
         jobs (:jobs manifest)
@@ -714,13 +797,34 @@
        :total (count jobs) :completed completed
        :overall overall :counts counts
        :unpublished (:unpublished artifacts)
-       :jobs entries})))
+       :jobs entries
+       :jvm-timing (when include-timing?
+                     (jvm-timing-summary! run jobs results))}))))
 
 (defn- print-report! [report]
   (println "SHARD REPORT" (name (:overall report)))
   (println "Jobs:" (:total report) "Completed:" (:completed report))
   (doseq [status report-status-order]
     (println (format "  %-24s %d" (name status) (get-in report [:counts status]))))
+  (when-let [{:keys [eligible measured missing invalid totals-ms slowest]}
+             (:jvm-timing report)]
+    (when (pos? eligible)
+      (println "JVM timing (advisory; passed namespace jobs):"
+               measured "/" eligible "measured;"
+               (count missing) "missing;" (count invalid) "invalid")
+      (println "  Summed job ms: wall" (:wall-ms totals-ms)
+               "launch/loading" (:launch-to-testing-ms totals-ms)
+               "test-report interval" (:testing-to-summary-ms totals-ms)
+               "shutdown" (:summary-to-exit-ms totals-ms))
+      (doseq [{:keys [id wall-ms launch-to-testing-ms testing-to-summary-ms]}
+              (take 5 slowest)]
+        (println "  Slow JVM:" id "wall" wall-ms "ms;"
+                 "launch/loading" launch-to-testing-ms "ms;"
+                 "test interval" testing-to-summary-ms "ms"))
+      (when (seq missing)
+        (println "  Missing JVM timing for:" (pr-str missing)))
+      (when (seq invalid)
+        (println "  Invalid/duplicate JVM timing for:" (pr-str invalid)))))
   (when (seq (:unpublished report))
     (println "Unpublished result files:" (pr-str (:unpublished report))))
   (doseq [{:keys [id status log blocked-by]} (:jobs report)
@@ -865,7 +969,7 @@
                        (.isFile (io/file dir "jobs.edn"))
                        (.isFile (io/file dir "schedule.edn")))
               (try
-                (let [report (report-data! (.getPath dir))
+                (let [report (report-data! (.getPath dir) false)
                       schedule (read-edn! (slurp (io/file dir "schedule.edn"))
                                           "historical schedule")]
                   (when (and (#{:pass :fail} (:overall report))
