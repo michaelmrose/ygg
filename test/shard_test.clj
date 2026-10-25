@@ -656,6 +656,244 @@ else:
         (is (exists? (file run "results" "job0.edn"))
             "A green worker result must not override a failed cleanup gate")))))
 
+
+
+;; v1091: Shard v1089 scoped, exactly-once preflight admission. Tests use the
+;; real Shard executable and fake Gesso/Ygg CLIs. All events live outside the
+;; Git checkout, so preflight cannot accidentally validate modified sources.
+(def ^:private prepared-bb-shim
+  "#!/usr/bin/env python3
+import os, pathlib, sys, time
+argv = sys.argv[1:]
+if argv and os.path.realpath(argv[0]) == os.path.realpath(os.environ['SHARD_TEST_EXECUTABLE']):
+    os.execv(os.environ['SHARD_TEST_REAL_BB'], [os.environ['SHARD_TEST_REAL_BB']] + argv)
+root = pathlib.Path.cwd()
+events = pathlib.Path(os.environ['SHARD_TEST_EVENTS'])
+def emit(value):
+    with events.open('a') as f:
+        f.write(value + '\\n')
+if len(argv) >= 2 and argv[0] == 'script/gesso_test.clj':
+    mode = argv[1]
+    if mode == 'preflight' and len(argv) == 2:
+        emit('preflight:start')
+        time.sleep(0.35)
+        if os.environ.get('SHARD_TEST_PREFLIGHT_FAILURE') == '1':
+            emit('preflight:failed')
+            sys.exit(7)
+        emit('preflight:passed')
+        sys.exit(0)
+    if mode == 'inventory:prepared' and len(argv) == 3:
+        scope = argv[2]
+        emit('inventory:start:' + scope)
+        time.sleep(0.35)
+        path = root / ('inventory-' + scope.replace(':', '_') + '.edn')
+        if not path.is_file():
+            emit('inventory:missing:' + scope)
+            sys.exit(8)
+        print(path.read_text(), end='')
+        emit('inventory:passed:' + scope)
+        sys.exit(0)
+    if mode in ('gate:prepared', 'jvm:namespace:prepared') and len(argv) == 3:
+        name = argv[2]
+        binding = os.environ.get('GESSO_SHARD_PREFLIGHT_COMMIT')
+        import subprocess
+        head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+        emit('job:started:' + name)
+        if binding != head:
+            emit('job:unbound:' + name)
+            sys.exit(9)
+        if os.environ.get('SHARD_TEST_JOB_FAILURE') == '1':
+            emit('job:failed:' + name)
+            sys.exit(11)
+        emit('job:passed:' + name)
+        sys.exit(0)
+emit('unexpected:' + repr(argv))
+sys.exit(2)")
+
+(defn- resolved-test-bb! [fx]
+  (let [candidate (:bb fx)
+        direct (file candidate)]
+    (or (when (and (.isFile direct) (.canExecute direct))
+          (.getCanonicalPath direct))
+        (some (fn [directory]
+                (let [p (file directory candidate)]
+                  (when (and (.isFile p) (.canExecute p))
+                    (.getCanonicalPath p))))
+              (str/split (or (System/getenv "PATH") "")
+                         (re-pattern (java.util.regex.Pattern/quote
+                                       java.io.File/pathSeparator))))
+        (throw (ex-info "Cannot locate Babashka for prepared Shard tests"
+                        {:command candidate})))))
+
+(defn- prepared-job [id gate target]
+  (assoc (job id ["bb" "script/gesso_test.clj"
+                  (if (= :jvm gate) "jvm:namespace:prepared" "gate:prepared")
+                  target])
+         :gate gate
+         :unit (if (= :jvm gate) {:type :namespace} {:type :gate})))
+
+(defn- prepared-gesso-project! [fx inventory-by-scope]
+  (let [root (:project fx)]
+    (.mkdirs (file root "script"))
+    (spit (file root "script" "gesso_test.clj") ";; simulated Gesso v1088 runner\n")
+    (spit (file root ".gitignore") "/.ygg/\n/.ygg.lock\n")
+    (doseq [[scope jobs] inventory-by-scope]
+      (spit (file root (str "inventory-" (str/replace scope ":" "_") ".edn"))
+            (pr-str {:jobs jobs})))
+    (run-git! fx "init" "-q")
+    (run-git! fx "add" ".")
+    (run-git! fx "-c" "user.name=ShardTest" "-c"
+              "user.email=shard@example.invalid" "commit" "-qm" "fixture")
+    root))
+
+(defn- prepared-shims! [fx]
+  (let [ygg (file (:bin fx) "ygg")
+        bb (file (:bin fx) "bb")
+        events (file (:base fx) "prepared-events.log")
+        actual-bb (resolved-test-bb! fx)]
+    (spit ygg fake-ygg)
+    (is (.setExecutable ygg true))
+    (spit bb prepared-bb-shim)
+    (is (.setExecutable bb true))
+    (spit events "")
+    {:events events
+     :env {"PATH" (str (.getAbsolutePath (:bin fx)) java.io.File/pathSeparator
+                        (System/getenv "PATH"))
+           "SHARD_TEST_EXECUTABLE" (:shard fx)
+           "SHARD_TEST_REAL_BB" actual-bb
+           "SHARD_TEST_EVENTS" (.getAbsolutePath events)}}))
+
+(defn- prepared-run! [fx {:keys [env]} scope extra-env]
+  (exec! (:project fx)
+         (into [(:bb fx) (:shard fx) "run" "--workers" "2"]
+               (when scope ["--scope" scope]))
+         (merge env extra-env) 45000))
+
+(defn- event-lines [{:keys [events]}]
+  (->> (str/split-lines (slurp events))
+       (remove str/blank?) vec))
+
+(defn- prepared-run-dir [fx]
+  (file (:project fx) ".ygg" "runs" "run-fixed-mock-run"))
+
+(deftest scoped-preflight-is-once-and-overlaps-inventory-preparation
+  (doseq [[scope jobs]
+          [["jvm" [(prepared-job "jvm-a" :jvm "gesso.sample-a-test")
+                   (prepared-job "jvm-b" :jvm "gesso.sample-b-test")]]
+           ["node:browser" [(prepared-job "node-browser" :node:browser "node:browser")]]]]
+    (with-fixture
+      (fn [fx]
+        (testing scope
+          (prepared-gesso-project! fx {scope jobs})
+          (let [shims (prepared-shims! fx)
+                result (prepared-run! fx shims scope {})
+                events (event-lines shims)
+                source-file (file (prepared-run-dir fx) "source.edn")
+                expected-head (str/trim (:out (exec! (:project fx)
+                                                  ["git" "rev-parse" "HEAD"] {})))]
+            (is (= 0 (:exit result)) (:out result))
+            (is (= 1 (count (filter #{"preflight:start"} events))) events)
+            (is (= 1 (count (filter #{"preflight:passed"} events))) events)
+            (is (= 1 (count (filter #{(str "inventory:start:" scope)} events))) events)
+            (is (= 1 (count (filter #{(str "inventory:passed:" scope)} events))) events)
+            (is (< (.indexOf events "preflight:start")
+                   (.indexOf events (str "inventory:passed:" scope)))
+                (pr-str events))
+            (is (< (.indexOf events (str "inventory:start:" scope))
+                   (.indexOf events "preflight:passed"))
+                (pr-str events))
+            (is (= (set (map #(str "job:passed:" (last (:command %))) jobs))
+                   (set (filter #(str/starts-with? % "job:passed:") events))))
+            (is (not-any? #(str/starts-with? % "job:unbound:") events))
+            (is (= (count jobs) (count (results (assoc fx :run (prepared-run-dir fx))))))
+            (is (exists? source-file))
+            (when (exists? source-file)
+              (let [source (edn/read-string (slurp source-file))]
+                (is (= scope (:scope source)))
+                (is (= expected-head (:git-head source)))
+                (is (= :passed (get-in source [:preflight :status])))
+                (is (= expected-head (get-in source [:preflight :git-head])))))
+            (is (not (exists? (file (:project fx) ".ygg" "fake-workers")))
+                "Successful run must clean fake clones")))))))
+
+(deftest default-gesso-run-selects-all-with-one-preflight
+  (with-fixture
+    (fn [fx]
+      (prepared-gesso-project! fx {"all" [(prepared-job "themes" :themes "themes")]})
+      (let [shims (prepared-shims! fx)
+            result (prepared-run! fx shims nil {})
+            events (event-lines shims)
+            source (file (prepared-run-dir fx) "source.edn")]
+        (is (= 0 (:exit result)) (:out result))
+        (is (= 1 (count (filter #{"preflight:start"} events))) events)
+        (is (= 1 (count (filter #{"inventory:start:all"} events))) events)
+        (is (some #{"job:passed:themes"} events))
+        (is (= "all" (:scope (edn/read-string (slurp source)))))))))
+
+(deftest failed-preflight-even-with-forged-caller-binding-launches-no-jobs
+  (with-fixture
+    (fn [fx]
+      (prepared-gesso-project! fx {"jvm" [(prepared-job "jvm-a" :jvm "gesso.sample-a-test")]})
+      (let [shims (prepared-shims! fx)
+            result (prepared-run! fx shims "jvm"
+                                 {"SHARD_TEST_PREFLIGHT_FAILURE" "1"
+                                  "GESSO_SHARD_PREFLIGHT_COMMIT" "forged"})
+            events (event-lines shims)]
+        (is (not= 0 (:exit result)) (:out result))
+        (is (str/includes? (:out result) "Repository integrity failed"))
+        (is (= 1 (count (filter #{"preflight:start"} events))) events)
+        (is (some #{"preflight:failed"} events))
+        (is (= 1 (count (filter #{"inventory:start:jvm"} events))) events)
+        (is (not-any? #(str/starts-with? % "job:") events) (pr-str events))
+        (is (not (exists? (file (:project fx) ".ygg" "fake-workers"))))
+        (is (not (exists? (file (prepared-run-dir fx) "jobs.edn"))))))))
+
+(deftest invalid-prepared-inventory-refuses-clones-after-one-preflight
+  (with-fixture
+    (fn [fx]
+      (prepared-gesso-project!
+        fx {"jvm" [(assoc (prepared-job "invalid" :integrity "integrity")
+                           :command ["bash" "-c" "true"])]})
+      (let [shims (prepared-shims! fx)
+            result (prepared-run! fx shims "jvm" {})
+            events (event-lines shims)]
+        (is (not= 0 (:exit result)) (:out result))
+        (is (str/includes? (:out result) "Scoped inventory preparation failed")
+            (:out result))
+        (is (= 1 (count (filter #{"preflight:start"} events))) events)
+        (is (= 1 (count (filter #{"preflight:passed"} events))) events)
+        (is (= 1 (count (filter #{"inventory:start:jvm"} events))) events)
+        (is (not-any? #(str/starts-with? % "job:") events))
+        (is (not (exists? (file (:project fx) ".ygg" "fake-workers"))))
+        (is (not (exists? (file (prepared-run-dir fx) "jobs.edn"))))))))
+
+(deftest invalid-gesso-scope-is-rejected-before-preflight
+  (with-fixture
+    (fn [fx]
+      (prepared-gesso-project! fx {"all" [(prepared-job "themes" :themes "themes")]})
+      (let [shims (prepared-shims! fx)
+            result (prepared-run! fx shims "unrecognized" {})
+            events (event-lines shims)]
+        (is (not= 0 (:exit result)))
+        (is (str/includes? (:out result) "Unsupported Gesso test scope"))
+        (is (empty? events) events)
+        (is (not (exists? (file (:project fx) ".ygg" "fake-workers"))))))))
+
+(deftest prepared-job-failure-is-reported-without-skipping-preflight
+  (with-fixture
+    (fn [fx]
+      (prepared-gesso-project! fx {"jvm" [(prepared-job "failing" :jvm "gesso.sample-a-test")]})
+      (let [shims (prepared-shims! fx)
+            result (prepared-run! fx shims "jvm" {"SHARD_TEST_JOB_FAILURE" "1"})
+            events (event-lines shims)]
+        (is (= 1 (:exit result)) (:out result))
+        (is (= 1 (count (filter #{"preflight:start"} events))))
+        (is (some #{"job:failed:gesso.sample-a-test"} events))
+        (is (not-any? #(str/starts-with? % "job:unbound:") events))
+        (is (= :failed (:status (edn/read-string
+                               (slurp (file (prepared-run-dir fx) "results" "failing.edn"))))))
+        (is (not (exists? (file (:project fx) ".ygg" "fake-workers"))))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
