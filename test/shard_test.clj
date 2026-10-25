@@ -637,25 +637,39 @@ else:
 (deftest invalid-test-session-evidence-forbids-supervisor-cleanup
   (with-fixture
     (fn [fx]
-      ;; The job deliberately tampers with its own session record after the
-      ;; worker has created it. Supervisors must fail closed even if the
-      ;; command and every worker exit normally.
-      (git-project! fx [(job "job0"
-                             ["bash" "-c"
-                              "printf 'invalid-session-data' > ../../runs/run-fixed-mock-run/claims/job0/session.edn"])] )
+      ;; The Shard basket is read-only *inside* Bubblewrap. Corrupt the
+      ;; evidence from the privileged host-side test harness while the job
+      ;; waits inside its writable clone. Cleanup must still refuse it.
+      (git-project! fx [(assoc (job "job0"
+                                    ["bash" "-c"
+                                     "touch session-job-ready; for i in $(seq 1 200); do test -e session-job-release && exit 0; sleep .05; done; exit 92"])
+                               :timeout-ms 16000)])
       (let [env (ygg-shim! fx)
             cmd [(:bb fx) (:shard fx) "run" "--workers" "1"
                  "--inventory" (:bb fx) "inventory.clj"]
-            done (exec! (:project fx) cmd env 45000)
-            run (file (:project fx) ".ygg" "runs" "run-fixed-mock-run")]
-        (is (= 2 (:exit done)) (:out done))
-        (is (str/includes? (:out done) "Invalid job-session record") (:out done))
-        (is (exists? (file (:project fx) ".ygg" "fake-workers"))
-            "Unsafe session evidence must prevent Ygg cleanup")
-        (is (exists? (file (:project fx) ".ygg" "workers" "1")))
-        (is (exists? (file run "results" "job0.edn"))
-            "A green worker result must not override a failed cleanup gate")))))
-
+            started (start-cli! fx (:project fx) cmd env)
+            run (file (:project fx) ".ygg" "runs" "run-fixed-mock-run")
+            clone (file (:project fx) ".ygg" "workers" "1")
+            session (file run "claims" "job0" "session.edn")]
+        (try
+          (is (await-file! (file clone "session-job-ready") 11000)
+              "Test must be executing before host corrupts its session record")
+          (is (await-file! session 3000)
+              "Host can see the active session evidence")
+          (when (exists? session)
+            (spit session "invalid-session-data"))
+          (spit (file clone "session-job-release") "release")
+          (let [done (finish-cli! started 23000)]
+            (is (= 2 (:exit done)) (:out done))
+            (is (str/includes? (:out done) "Invalid job-session record") (:out done)))
+          (is (exists? (file (:project fx) ".ygg" "fake-workers"))
+              "Unsafe session evidence must prevent Ygg cleanup")
+          (is (exists? clone))
+          (is (exists? (file run "results" "job0.edn"))
+              "Green job evidence cannot override unsafe cleanup evidence")
+          (finally
+            (when (.isAlive ^Process (:process started))
+              (terminate-cli! started))))))))
 
 
 ;; v1091: Shard v1089 scoped, exactly-once preflight admission. Tests use the
@@ -1217,6 +1231,216 @@ sys.exit(2)")
         (is (= before (slurp (file (:run fx) "results" "one.edn"))))
         (is (= :pass (get-in first [:edn :overall])))
         (is (= 1 (get-in first [:edn :jvm-timing :measured])))))))
+
+;; v1102: Bubblewrap is a mandatory execution boundary, not an optional
+;; optimization. A test-only unshare shim can exercise *real* Linux net/PID
+;; namespace separation when native bwrap is absent; only a native bwrap
+;; installation can certify the read-only host mount view.
+(defn- sandbox-script! [fx name content]
+  (let [path (file (:bin fx) name)]
+    (spit path content)
+    (is (.setExecutable path true))
+    (.getAbsolutePath path)))
+
+(defn- sandbox-bin-env [fx]
+  {"PATH" (str (.getAbsolutePath (:bin fx)) java.io.File/pathSeparator
+               (System/getenv "PATH"))})
+
+(defn- bwrap-on-test-path []
+  (some (fn [directory]
+          (let [candidate (file directory "bwrap")]
+            (when (and (.isFile candidate) (.canExecute candidate))
+              (.getAbsolutePath candidate))))
+        (str/split (or (System/getenv "PATH") "")
+                   (re-pattern (java.util.regex.Pattern/quote
+                                 java.io.File/pathSeparator)))))
+
+(def ^:private fake-bwrap-without-namespaces
+  "#!/bin/sh\n# Mimic argument handling but refuse no namespace flags: the real\n# Shard sandbox-probe must reject an unsandboxed subprocess.\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--' ]; then shift; exec \"$@\"; fi\n  shift\ndone\nexit 98\n")
+
+(deftest sandbox-worker-refuses-missing-or-noop-bubblewrap-before-claim
+  (doseq [kind [:missing :noop]]
+    (with-fixture
+      (fn [fx]
+        (enumerate! fx [(job "untouched" ["bash" "-c" "touch UNSANDBOXED"])])
+        (when (= kind :noop)
+          (sandbox-script! fx "bwrap" fake-bwrap-without-namespaces))
+        (let [path (.getAbsolutePath (:bin fx))
+              outcome (exec! (:project fx)
+                             [(resolved-test-bb! fx) (:shard fx) "worker"
+                              (str (:run fx)) (str (:workspace fx)) "jvm" "100"]
+                             {"PATH" path} 18000)]
+          (is (= 2 (:exit outcome)) (str kind " " (:out outcome)))
+          (is (re-find #"(?i)(bubblewrap|sandbox)" (:out outcome)) (:out outcome))
+          (is (empty? (or (.listFiles (file (:run fx) "claims")) [])))
+          (is (empty? (or (.listFiles (file (:run fx) "results")) [])))
+          (is (not (exists? (file (:workspace fx) "UNSANDBOXED")))))))))
+
+(deftest sandbox-supervisor-refuses-noop-bubblewrap-before-clone-creation
+  (with-fixture
+    (fn [fx]
+      (git-project! fx [(job "must-not-start"
+                             ["bash" "-c" "touch UNSANDBOXED"])])
+      (let [env (ygg-shim! fx)
+            _ (sandbox-script! fx "bwrap" fake-bwrap-without-namespaces)
+            outcome (exec! (:project fx)
+                           [(:bb fx) (:shard fx) "run" "--workers" "2"
+                            "--inventory" (:bb fx) "inventory.clj"]
+                           env 30000)]
+        (is (= 2 (:exit outcome)) (:out outcome))
+        (is (str/includes? (:out outcome) "refusing unsandboxed jobs") (:out outcome))
+        (is (not (exists? (file (:project fx) ".ygg" "fake-workers")))
+            "Ygg clone creation must not be reached")
+        (is (not (exists? (file (:project fx) ".ygg" "runs" "run-fixed-mock-run"))))
+        (is (not (exists? (file (:project fx) "UNSANDBOXED"))))))))
+
+(deftest sandbox-arguments-are-required-for-preflight-and-every-claimed-job
+  (with-fixture
+    (fn [fx]
+      (let [actual (bwrap-on-test-path)
+            audit (file (:base fx) "bwrap-audit.log")]
+        (is (some? actual) "This test requires bwrap or a namespace-capable test shim")
+        (when actual
+          (let [escaped (str/replace (.getAbsolutePath audit) "'" "'\\''")
+                launcher (str "#!/bin/sh\nprintf '%s\\n' BEGIN \"$@\" END >> '"
+                              escaped "'\nexec '"
+                              (str/replace actual "'" "'\\''") "' \"$@\"\n")]
+            (sandbox-script! fx "bwrap" launcher)
+            (enumerate! fx [(job "first" ["bash" "-c" "printf yes > first-out"])
+                            (job "second" ["bash" "-c" "printf yes > second-out"])])
+            (let [outcome (exec! (:project fx)
+                                 [(:bb fx) (:shard fx) "worker" (str (:run fx))
+                                  (str (:workspace fx)) "jvm" "100"]
+                                 (sandbox-bin-env fx) 60000)
+                  data (str/split-lines (slurp audit))
+                  starts (count (filter #{"BEGIN"} data))
+                  ends (count (filter #{"END"} data))
+                  invocations (->> data
+                                   (partition-by #{"BEGIN" "END"})
+                                   (remove #(#{"BEGIN" "END"} (first %)))
+                                   (mapv vec))
+                  path (.getCanonicalPath (:workspace fx))]
+              (is (= 0 (:exit outcome)) (:out outcome))
+              (is (= 3 starts) "One preflight plus one sandbox per job")
+              (is (= starts ends))
+              (doseq [required ["--unshare-user" "--unshare-pid" "--unshare-net"
+                                "--unshare-ipc" "--die-with-parent" "--ro-bind"
+                                "--bind" "--proc" "--dev" "--chdir"
+                                "/proc" "/dev" path]]
+                (is (every? (fn [argv] (some #{required} argv)) invocations)
+                    (str "Required argument on every invocation: " required)))
+              (is (= 3 (count invocations)))
+              (is (= 2 (count (results fx))))
+              (is (every? #(= :passed (:status %)) (vals (results fx))))
+              (is (exists? (file (:workspace fx) "first-out")))
+              (is (exists? (file (:workspace fx) "second-out"))))))))))
+
+(deftest sandbox-really-separates-network-pid-and-mount-namespaces
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx
+                  [(job "namespace-view"
+                        ["bash" "-c"
+                         "readlink /proc/self/ns/net > net.id; readlink /proc/self/ns/pid > pid.id; readlink /proc/self/ns/mnt > mnt.id"])])
+      (let [outcome (worker fx)]
+        (is (= 0 (:exit outcome)) (:out outcome))
+        (is (= :passed (get-in (results fx) ["namespace-view.edn" :status])))
+        (doseq [name ["net" "pid" "mnt"]]
+          (let [child (str/trim (slurp (file (:workspace fx) (str name ".id"))))
+                host (str (Files/readSymbolicLink
+                            (.toPath (file "/proc/self/ns" name))))]
+            (is (re-matches #"[a-z]+:\[[0-9]+\]" child))
+            (is (not= host child)
+                (str name " namespace must differ from the parent"))))))))
+
+(deftest sandbox-concurrent-workers-can-hold-identical-localhost-port
+  (with-fixture
+    (fn [fx]
+      (let [other (file (:base fx) "workspace-two")
+            _ (.mkdirs other)
+            code (str "import pathlib,socket,time,sys\n"
+                      "s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+                      "s.bind(('127.0.0.1',44937)); s.listen(1)\n"
+                      "pathlib.Path('port-bound').write_text('yes')\n"
+                      "limit=time.monotonic()+13\n"
+                      "while not pathlib.Path('port-release').exists():\n"
+                      "  if time.monotonic()>limit: sys.exit(97)\n"
+                      "  time.sleep(.03)\n")]
+        (enumerate! fx [(assoc (job "port-a" ["python3" "-c" code]) :timeout-ms 18000)
+                        (assoc (job "port-b" ["python3" "-c" code]) :timeout-ms 18000)])
+        (let [start-a (start-cli! fx (:project fx)
+                                  [(:bb fx) (:shard fx) "worker" (str (:run fx))
+                                   (str (:workspace fx)) "jvm" "300"] {})
+              start-b (start-cli! fx (:project fx)
+                                  [(:bb fx) (:shard fx) "worker" (str (:run fx))
+                                   (str other) "jvm" "300"] {})]
+          (try
+            (let [a (await-file! (file (:workspace fx) "port-bound") 14000)
+                  b (await-file! (file other "port-bound") 14000)]
+              (is a "First worker must bind while other worker is running")
+              (is b "Second worker must bind the identical port before release")
+              (is (and a b) "Both servers must hold port 44937 simultaneously"))
+            (finally
+              ;; Release both servers even if an assertion fails, preventing
+              ;; orphaned jobs and long waits in a failed regression.
+              (spit (file (:workspace fx) "port-release") "release")
+              (spit (file other "port-release") "release")
+              (let [done-a (finish-cli! start-a 24000)
+                    done-b (finish-cli! start-b 24000)]
+                (is (= 0 (:exit done-a)) (:out done-a))
+                (is (= 0 (:exit done-b)) (:out done-b)))))
+          (is (= #{"port-a.edn" "port-b.edn"} (set (keys (results fx)))))
+          (is (every? #(= :passed (:status %)) (vals (results fx))))
+          (is (= :pass (get-in (report fx) [:edn :overall]))))))))
+
+(deftest sandbox-private-environment-refuses-symlink-before-claim
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx [(job "never" ["bash" "-c" "touch UNSANDBOXED"])])
+      (let [base (file (:workspace fx) ".ygg")
+            redirection (file (:base fx) "outside")]
+        (.mkdirs base)
+        (.mkdirs redirection)
+        (Files/createSymbolicLink
+          (.toPath (file base "shard-worker-env"))
+          (.toPath redirection) attrs)
+        (let [outcome (worker fx)]
+          (is (= 2 (:exit outcome)) (:out outcome))
+          (is (str/includes? (:out outcome) "Unsafe worker environment directory")
+              (:out outcome))
+          (is (empty? (or (.listFiles (file (:run fx) "claims")) [])))
+          (is (not (exists? (file redirection "never")))))))))
+
+(deftest native-bubblewrap-host-mount-is-readonly-while-workspace-is-writable
+  ;; A test-only unshare shim cannot simulate ro-bind. Execute this test ONLY
+  ;; against a native bwrap executable; it becomes mandatory automatically
+  ;; whenever bwrap is installed in a standard system location.
+  (let [native (some (fn [p] (when (and (.isFile (file p))
+                                         (.canExecute (file p))) p))
+                     ["/usr/bin/bwrap" "/bin/bwrap"])]
+    (if (nil? native)
+      (println "SKIP native Bubblewrap read-only mount test: bwrap not installed")
+      (with-fixture
+        (fn [fx]
+          (let [outside (file (:base fx) "outside")]
+            (.mkdirs outside)
+            (enumerate! fx
+                        [(job "mount"
+                              ["bash" "-c"
+                               (str "if printf unsafe > '" (.getAbsolutePath
+                                    (file outside "untrusted-write"))
+                                    "' 2>/dev/null; then exit 51; fi; "
+                                    "printf safe > inside-clone")])])
+            (let [outcome (exec! (:project fx)
+                                 [(:bb fx) (:shard fx) "worker" (str (:run fx))
+                                  (str (:workspace fx)) "jvm" "100"]
+                                 {"PATH" (str (.getParent (file native))
+                                              java.io.File/pathSeparator
+                                              (System/getenv "PATH"))} 30000)]
+              (is (= 0 (:exit outcome)) (:out outcome))
+              (is (= :passed (get-in (results fx) ["mount.edn" :status])))
+              (is (exists? (file (:workspace fx) "inside-clone")))
+              (is (not (exists? (file outside "untrusted-write")))))))))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
