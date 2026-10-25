@@ -1914,6 +1914,143 @@ sys.exit(2)")
                                              "Production runtime / real Chromium integration: PASS")
                               (str "Real Gesso Playwright integration not proven: " id)))))))))))))))
 
+
+;; v1107 — Browser scratch admission is a testable, fail-closed contract.
+;; We cannot assume bwrap is installed on every regression host.  This
+;; namespace-capable test-only launcher runs the REAL v1106 sandbox probe in
+;; new Linux user/net/PID/mount namespaces.  For refusal cases, it remounts a
+;; real /tmp or /dev/shm mount read-only in that child namespace.  This does
+;; not imitate or certify Bubblewrap's host read-only mount policy; see the
+;; separate native Bubblewrap regression above for that proof obligation.
+(def ^:private scratch-namespace-bwrap-shim
+  (str "#!/usr/bin/env python3\n"
+       "import os, sys, subprocess\n"
+       "argv=sys.argv[1:]\n"
+       "if '--' not in argv: sys.exit(91)\n"
+       "for flag in ('--unshare-user','--unshare-net','--unshare-pid',\n"
+       "             '--unshare-ipc','--ro-bind','--bind','--proc','--dev'):\n"
+       "    if flag not in argv: sys.exit(92)\n"
+       "command=argv[argv.index('--')+1:]\n"
+       "if not command: sys.exit(93)\n"
+       "inner = '''import os,sys,subprocess\n"
+       "subprocess.run(['ip','link','set','lo','up'],check=True)\n"
+       "target=os.environ.get('SHARD_TEST_SCRATCH_READONLY','')\n"
+       "if target:\n"
+       "    if target not in ('/tmp','/dev/shm'): sys.exit(94)\n"
+       "    subprocess.run(['mount','--bind',target,target],check=True)\n"
+       "    subprocess.run(['mount','-o','remount,bind,ro',target],check=True)\n"
+       "os.execvp(sys.argv[1],sys.argv[1:])\n"
+       "'''\n"
+       "command=['unshare','--user','--map-root-user','--net','--pid',\n"
+       "         '--mount','--fork','python3','-c',inner]+command\n"
+       "os.execvp(command[0],command)\n"))
+
+(defn- namespace-scratch-shim! [fx]
+  (sandbox-script! fx "bwrap" scratch-namespace-bwrap-shim)
+  (let [real-bb (resolved-test-bb! fx)
+        link (file (:bin fx) "bb")]
+    (when-not (exists? link)
+      (Files/createSymbolicLink (.toPath link)
+                                (.toPath (file real-bb)) attrs)))
+  (sandbox-bin-env fx))
+
+(defn- scratch-worker! [fx env]
+  (exec! (:project fx)
+         [(:bb fx) (:shard fx) "worker"
+          (str (:run fx)) (str (:workspace fx)) "jvm" "100"]
+         env 30000))
+
+(defn- assert-no-admitted-scratch-job! [fx result label]
+  (is (= 2 (:exit result)) (str label ": " (:out result)))
+  (is (str/includes? (:out result) "Browser scratch directory is not writable")
+      (str label ": the runtime scratch probe (not namespace setup) must reject it: "
+           (:out result)))
+  (is (empty? (or (.listFiles (file (:run fx) "claims")) []))
+      (str label ": refusal must precede claims"))
+  (is (empty? (or (.listFiles (file (:run fx) "results")) []))
+      (str label ": refusal cannot publish a result"))
+  (is (not (exists? (file (:workspace fx) "scratch-job-ran")))
+      (str label ": no job subprocess was executed")))
+
+(deftest sandbox-browser-scratch-probe-accepts-real-writable-paths
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx [(job "scratch-ok" ["python3" "-c"
+                                           (str "from pathlib import Path\n"
+                                                "import tempfile\n"
+                                                "with tempfile.TemporaryDirectory(dir='/tmp') as td, "
+                                                "tempfile.TemporaryDirectory(dir='/dev/shm') as sd:\n"
+                                                "    a=Path(td)/'probe'; b=Path(sd)/'probe'\n"
+                                                "    a.write_text('tmp-ok'); b.write_text('shm-ok')\n"
+                                                "    assert a.read_text()=='tmp-ok'\n"
+                                                "    assert b.read_text()=='shm-ok'\n"
+                                                "Path('scratch-job-ran').write_text('ok')\n")])])
+      (let [env (namespace-scratch-shim! fx)
+            outcome (scratch-worker! fx env)]
+        (is (= 0 (:exit outcome)) (:out outcome))
+        (is (= :passed (get-in (results fx) ["scratch-ok.edn" :status])))
+        (is (= "ok" (slurp (file (:workspace fx) "scratch-job-ran"))))
+        (is (= :pass (get-in (report fx) [:edn :overall])))))))
+
+(deftest sandbox-browser-scratch-readonly-probe-refuses-before-worker-claims
+  (doseq [directory ["/tmp" "/dev/shm"]]
+    (with-fixture
+      (fn [fx]
+        (enumerate! fx [(job "scratch-nope" ["bash" "-c" "touch scratch-job-ran"])])
+        (let [env (assoc (namespace-scratch-shim! fx)
+                         "SHARD_TEST_SCRATCH_READONLY" directory)
+              outcome (scratch-worker! fx env)]
+          (assert-no-admitted-scratch-job! fx outcome directory)
+          ;; An admission failure must not poison this basket. A later
+          ;; invocation with genuinely writable scratch can still claim and
+          ;; complete the same job exactly once.
+          (let [recovered (scratch-worker!
+                            fx (dissoc env "SHARD_TEST_SCRATCH_READONLY"))]
+            (is (= 0 (:exit recovered)) (:out recovered))
+            (is (= :passed (get-in (results fx) ["scratch-nope.edn" :status])))
+            (is (exists? (file (:workspace fx) "scratch-job-ran")))
+            (is (= 1 (count (results fx))))))))))
+
+(deftest sandbox-browser-scratch-readonly-preflight-refuses-before-clones
+  (doseq [directory ["/tmp" "/dev/shm"]]
+    (with-fixture
+      (fn [fx]
+        (git-project! fx [(job "scratch-nope" ["bash" "-c" "touch scratch-job-ran"])])
+        (let [env (merge (ygg-shim! fx)
+                         (namespace-scratch-shim! fx)
+                         {"SHARD_TEST_SCRATCH_READONLY" directory})
+              result (exec! (:project fx)
+                            [(:bb fx) (:shard fx) "run" "--workers" "2"
+                             "--inventory" (:bb fx) "inventory.clj"]
+                            env 30000)]
+          (is (= 2 (:exit result)) (str directory ": " (:out result)))
+          (is (str/includes? (:out result) "Browser scratch directory is not writable")
+              (str directory ": the actual scratch probe must reject it: "
+                   (:out result)))
+          (is (not (exists? (file (:project fx) ".ygg" "fake-workers")))
+              (str directory ": preflight must prevent Ygg clone creation"))
+          (is (not (exists? (file (:project fx) ".ygg" "runs" "run-fixed-mock-run")))
+              (str directory ": no job basket should have been started"))
+          (is (not (exists? (file (:project fx) "scratch-job-ran")))))))))
+
+(deftest sandbox-browser-scratch-noop-launcher-remains-fail-closed
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx [(job "scratch-nope" ["bash" "-c" "touch scratch-job-ran"])])
+      ;; Writable host scratch must not let a launcher without namespace
+      ;; separation pass admission: both properties are mandatory.
+      (sandbox-script! fx "bwrap" fake-bwrap-without-namespaces)
+      (let [outcome (exec! (:project fx)
+                           [(resolved-test-bb! fx) (:shard fx) "worker"
+                            (str (:run fx)) (str (:workspace fx)) "jvm" "100"]
+                           (sandbox-bin-env fx) 18000)]
+        (is (= 2 (:exit outcome)) (:out outcome))
+        (is (str/includes? (:out outcome) "refusing unsandboxed jobs")
+            (:out outcome))
+        (is (empty? (or (.listFiles (file (:run fx) "claims")) [])))
+        (is (empty? (or (.listFiles (file (:run fx) "results")) [])))
+        (is (not (exists? (file (:workspace fx) "scratch-job-ran"))))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
