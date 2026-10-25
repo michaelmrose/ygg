@@ -517,6 +517,31 @@
                  (read-only-cache-mounts worker-env))
            (into ["--chdir" path "--"] command)))))
 
+;; Chromium and the Playwright Java driver use Linux scratch locations even
+;; when TMPDIR points somewhere else. Merely creating a mount namespace says
+;; nothing about whether those locations can actually be written. Verify them
+;; during the supervisor's admission probe, before creating ZFS clones; the
+;; standalone worker repeats the same check before its first claim.
+(defn- require-sandbox-scratch! [directory]
+  (let [folder (.toPath (io/file directory))]
+    (require! (Files/isDirectory folder worker-env-no-follow)
+              "Browser scratch directory is missing or symlinked"
+              {:directory directory})
+    (let [probe (try
+                  (Files/createTempFile folder "shard-browser-scratch-" ".tmp"
+                                        no-attributes)
+                  (catch Exception ex
+                    (fail! "Browser scratch directory is not writable"
+                           {:directory directory :cause (.getMessage ex)})))]
+      (try
+        (Files/writeString probe "playwright-scratch-ready"
+                           (make-array OpenOption 0))
+        (require! (= "playwright-scratch-ready" (Files/readString probe))
+                  "Browser scratch directory failed round-trip verification"
+                  {:directory directory})
+        (finally
+          (Files/deleteIfExists probe))))))
+
 (defn- verify-sandbox-probe! [parent-net parent-pid parent-mnt]
   (require! (every? #(and (string? %) (re-matches #"[a-z]+:\[[0-9]+\]" %))
                    [parent-net parent-pid parent-mnt])
@@ -537,6 +562,11 @@
         (with-open [accepted (.accept server)]
           (require! (.isConnected accepted)
                     "Sandbox loopback transport is not functional")))))
+  ;; Probe both default browser scratch locations, not just TMPDIR. A
+  ;; read-only /dev/shm or /tmp fails admission, rather than making every
+  ;; Playwright job fail individually after it has already been claimed.
+  (doseq [directory ["/tmp" "/dev/shm"]]
+    (require-sandbox-scratch! directory))
   (println "SHARD SANDBOX PROBE OK")
   (flush))
 
