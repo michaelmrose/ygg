@@ -4,7 +4,8 @@
 ;;        ./shard worker RUN-DIR WORKSPACE-DIR RUNTIME [MAX-IDLE-MS] [STACK-INDEX]
 ;;        ./shard report RUN-DIR [--edn]
 ;;        ./shard gesso-inventory [GESSO-ROOT]  ; EDN on stdout
-;;        ./shard run --workers N [--inventory COMMAND ARG ...]
+;;        ./shard run --workers N [--scope SCOPE]
+;;        ./shard run --workers N --inventory COMMAND ARG ...  ; generic projects
 (require '[clojure.edn :as edn]
          '[clojure.java.io :as io]
          '[clojure.java.shell :as shell]
@@ -1123,11 +1124,19 @@
         [(.getPath file)]
         ["bb" (.getPath file)]))))
 
-(defn- start-worker! [command run workspace runtime index]
+(def ^:private preflight-binding "GESSO_SHARD_PREFLIGHT_COMMIT")
+
+(defn- start-worker! [command run workspace runtime index admitted-head]
   (let [log (io/file run (str "worker-" index ".log"))
         argv (into command ["worker" (str run) (str workspace)
                             (name runtime) "60000" (str index)])
-        b (ProcessBuilder. ^java.util.List argv)]
+        b (ProcessBuilder. ^java.util.List argv)
+        env (.environment b)]
+    ;; Only this coordinator may transmit the preflighted source binding.
+    ;; Never inherit a caller-supplied binding for an unadmitted run.
+    (if admitted-head
+      (.put env preflight-binding admitted-head)
+      (.remove env preflight-binding))
     (.directory b (io/file workspace))
     (.redirectErrorStream b true)
     (.redirectOutput b (ProcessBuilder$Redirect/to log))
@@ -1143,7 +1152,7 @@
       (.destroyForcibly process)
       (.waitFor process 3 TimeUnit/SECONDS))))
 
-(defn- execute-workers! [run clones manifest]
+(defn- execute-workers! [run clones manifest admitted-head]
   (let [;; Exactly one worker per writable clone, regardless of runtime.
         specs (worker-specs clones (:jobs manifest))
         script (script-command!)
@@ -1153,7 +1162,7 @@
       (fn []
         (try
           (doseq [[i {:keys [workspace runtime]}] (map-indexed vector specs)]
-            (swap! started conj (start-worker! script run workspace runtime (inc i))))
+            (swap! started conj (start-worker! script run workspace runtime (inc i) admitted-head)))
           (catch Exception ex
             (terminate-workers! @started)
             (fail! "Could not start every Shard worker; clones retained"
@@ -1182,10 +1191,13 @@
                  (println "SHARD UNSAFE TO CLEAN:" (.getMessage ex)))))))))
 
 (defn- parse-run-options! [argv]
-  (loop [args (vec argv) n nil]
+  (loop [args (vec argv) n nil scope nil]
     (cond
-      (empty? args) (do (require! (some? n) "Usage: shard run --workers N [--inventory COMMAND ARG ...]")
-                        {:workers n})
+      (empty? args)
+      (do (require! (some? n)
+                    "Usage: shard run --workers N [--scope SCOPE | --inventory COMMAND ARG ...]")
+          {:workers n :scope scope})
+
       (= "--workers" (first args))
       (do (require! (and (nil? n) (second args))
                     "Missing or duplicate --workers")
@@ -1193,37 +1205,131 @@
                             (catch Exception _ nil))]
             (require! (and parsed (<= 1 parsed 256))
                       "--workers must be 1..256")
-            (recur (subvec args 2) parsed)))
+            (recur (subvec args 2) parsed scope)))
+
+      (= "--scope" (first args))
+      (do (require! (and (nil? scope) (second args)
+                         (re-matches #"[a-z][a-z:]*" (second args)))
+                    "Missing or duplicate --scope")
+          (recur (subvec args 2) n (second args)))
+
       (= "--inventory" (first args))
-      (do (require! (some? n) "Supply --workers N before --inventory")
+      (do (require! (and (some? n) (nil? scope))
+                    "Cannot combine --inventory and --scope; supply --workers N first")
           (let [cmd (vec (rest args))]
             (require! (string-vector? cmd) "Missing inventory command")
             {:workers n :inventory-command cmd}))
-      :else (fail! "Usage: shard run --workers N [--inventory COMMAND ARG ...]"))))
+
+      :else (fail! "Usage: shard run --workers N [--scope SCOPE | --inventory COMMAND ARG ...]"))))
+
+(def ^:private supported-gesso-scopes
+  #{"all" "jvm" "formal" "cljs" "node" "node:choreo" "node:browser"
+    "browser" "browser:integration" "advanced" "themes"})
+
+(defn- gesso-project? [root]
+  (.isFile (io/file root "script/gesso_test.clj")))
+
+(defn- verify-prepared-jobs! [jobs]
+  ;; Fail closed even if a project emits arbitrary executable commands under
+  ;; the name 'inventory:prepared'. Only the known Gesso prepared entrypoints
+  ;; may run after this invocation's successful integrity receipt.
+  (require! (and (vector? jobs) (seq jobs))
+            "Preflight-ready inventory is empty")
+  (doseq [{:keys [command gate]} jobs]
+    (require! (and (vector? command) (= 4 (count command))
+                   (= ["bb" "script/gesso_test.clj"] (subvec command 0 2))
+                   (contains? #{"jvm:namespace:prepared" "gate:prepared"}
+                              (nth command 2))
+                   (string? (nth command 3))
+                   (not (str/blank? (nth command 3)))
+                   (not= :integrity gate))
+              "Scoped inventory contains an unadmitted or repeated-integrity job"
+              {:command command :gate gate})))
+
+(defn- prepare-run-plan! [root head opts prepared?]
+  ;; This entire function can run in parallel with repository integrity.
+  ;; Besides discovering and validating every job, it balances provisional
+  ;; workers using historical timings before any clones are provisioned.
+  (let [inventory (run-inventory! root
+                    (if prepared?
+                      ["bb" "script/gesso_test.clj" "inventory:prepared"
+                       (or (:scope opts) "all")]
+                      (or (:inventory-command opts)
+                          (default-inventory-command root))))
+        _ (when prepared? (verify-prepared-jobs! (:jobs inventory)))
+        provisional-status {:snapshot-guid "pending-source-snapshot"}
+        manifest (inventory-manifest! root head provisional-status inventory)
+        virtual-clones (mapv (fn [i] {:mountpoint
+                                      (str (io/file root ".ygg" "workers" (str i)))})
+                             (range 1 (inc (:workers opts))))
+        specs (worker-specs virtual-clones (:jobs manifest))
+        schedule (prepare-schedule root manifest specs)]
+    {:inventory inventory :schedule schedule :job-count (count (:jobs manifest))}))
+
+(defn- preflight-once! [root head]
+  (let [started (System/nanoTime)]
+    ;; The only repository-integrity invocation for this Shard run.
+    (command! root ["bb" "script/gesso_test.clj" "preflight"])
+    {:format :shard/preflight :version 1 :status :passed
+     :git-head head :command ["bb" "script/gesso_test.clj" "preflight"]
+     :duration-ms (long (/ (- (System/nanoTime) started) 1000000))
+     :completed-at (str (Instant/now))}))
+
+(defn- parallel-preparation! [root head opts]
+  ;; Both branches are joined, including on failure. No ZFS clone or job may
+  ;; start until integrity and enumeration/optimization have both finished.
+  (let [integrity (future (try {:value (preflight-once! root head)}
+                               (catch Throwable ex {:error ex})))
+        planning (future (try {:value (prepare-run-plan! root head opts true)}
+                              (catch Throwable ex {:error ex})))
+        integrity-result @integrity
+        planning-result @planning]
+    (when-let [ex (:error integrity-result)]
+      (fail! "Repository integrity failed; no jobs or clones started"
+             {:cause (.getMessage ^Throwable ex)
+              :detail (when (instance? clojure.lang.ExceptionInfo ex)
+                        (ex-data ex))}))
+    (when-let [ex (:error planning-result)]
+      (fail! "Scoped inventory preparation failed; no jobs or clones started"
+             {:cause (.getMessage ^Throwable ex)
+              :detail (when (instance? clojure.lang.ExceptionInfo ex)
+                        (ex-data ex))}))
+    (merge (:value planning-result) {:preflight (:value integrity-result)})))
 
 (defn- run! [opts]
   (let [root (.getCanonicalFile (io/file (System/getProperty "user.dir")))
         _ (ensure-root-basket! root)]
     (with-run-lock! root
       (fn []
-        ;; Snapshot exactly the committed tree; .ygg is execution metadata.
         (let [head (source-revision! root)
-              inventory (run-inventory! root
-                          (or (:inventory-command opts)
-                              (default-inventory-command root)))
-              previous (ygg-status! root)]
-          ;; Inventory discovery is not allowed to mutate source that will
-          ;; subsequently be snapshotted and executed by the workers.
+              gesso? (gesso-project? root)
+              _ (require! (or gesso? (nil? (:scope opts)))
+                          "--scope requires a Gesso project with prepared inventory")
+              _ (when (:scope opts)
+                  (require! (contains? supported-gesso-scopes (:scope opts))
+                            "Unsupported Gesso test scope" {:scope (:scope opts)}))
+              _ (require! (not (and gesso? (:inventory-command opts)))
+                          "Gesso uses exactly-once preflight; do not supply legacy --inventory")
+              previous (ygg-status! root)
+              _ (require! (= :idle (:status previous))
+                          "Existing Ygg clones must be cleaned before a new run"
+                          {:status (:status previous)})
+              preparation (if gesso?
+                            (parallel-preparation! root head opts)
+                            (prepare-run-plan! root head opts false))
+              inventory (:inventory preparation)
+              preflight (:preflight preparation)]
+          ;; Check again after both concurrent tasks; neither may change the
+          ;; snapshot source. No test or clone exists before this barrier.
           (require! (= head (source-revision! root))
-                    "Project source changed during inventory enumeration")
-          (require! (= :idle (:status previous))
-                    "Existing Ygg clones must be cleaned before a new run"
-                    {:status (:status previous)})
+                    "Project source changed during preflight or scheduling")
           (println "SHARD SOURCE" head)
+          (when preflight
+            (println "SHARD PREFLIGHT" (name (:status preflight))
+                     "ONCE" (:duration-ms preflight) "ms"))
+          (println "SHARD PREPARED" (:job-count preparation) "jobs")
           (flush)
           (command! root ["ygg" "-n" (str (:workers opts)) "create"])
-          ;; A concurrent external ygg clean can race between create and the
-          ;; lock acquisition. Verify again *inside* the worker lease.
           (let [outcome
                 (with-workers-lock! root
                   (fn []
@@ -1231,7 +1337,12 @@
                           clones (checked-clones! root status (:workers opts) head)
                           manifest (inventory-manifest! root head status inventory)
                           specs (worker-specs clones (:jobs manifest))
-                          schedule (prepare-schedule root manifest specs)
+                          ;; Source identity changes on snapshot creation;
+                          ;; planning assignments and timings do not.
+                          schedule (assoc (:schedule preparation)
+                                          :inventory-sha256 (:inventory-sha256 manifest))
+                          _ (require! (valid-queues? (:queues schedule) specs (:jobs manifest))
+                                      "Prepared schedule disagrees with verified clones")
                           run-name (str "run-" (:run-id status))
                           run (io/file root ".ygg" "runs" run-name)]
                       (publish! run manifest)
@@ -1241,6 +1352,8 @@
                       (spit (io/file run "source.edn")
                             (canonical-edn {:format :shard/source :version 1
                                             :git-head head
+                                            :preflight preflight
+                                            :scope (when gesso? (or (:scope opts) "all"))
                                             :ygg-run-id (:run-id status)
                                             :ygg-snapshot (:snapshot status)
                                             :inventory-sha256 (:inventory-sha256 manifest)
@@ -1248,15 +1361,14 @@
                       (println "SHARD RUN" (.getPath run)
                                "JOBS" (count (:jobs manifest)))
                       (flush)
-                      (execute-workers! run clones manifest)
+                      (execute-workers! run clones manifest
+                                        (when preflight head))
                       (let [report (report-data! (.getPath run))]
                         (print-report! report)
                         (require! (not= :incomplete (:overall report))
                                   "Run is incomplete; preserve clones and results"
                                   {:run (str run)})
                         {:run run :report report}))))]
-            ;; Every child has exited normally and every job has a terminal
-            ;; result, even when the suite FAILED. Only now is cleanup safe.
             (command! root ["ygg" "clean"])
             (println "SHARD CLEANED" (str (:run outcome)))
             (flush)
@@ -1315,7 +1427,7 @@
         (print (canonical-edn (gesso-inventory! (or project-root "."))))
         (flush))
 
-      (fail! "Usage: shard enumerate CONFIG.edn NEW-RUN-DIR | shard worker RUN-DIR WORKSPACE-DIR RUNTIME [MAX-IDLE-MS] | shard report RUN-DIR [--edn] | shard gesso-inventory [GESSO-ROOT] | shard run --workers N [--inventory COMMAND ARG ...]"))
+      (fail! "Usage: shard enumerate CONFIG.edn NEW-RUN-DIR | shard worker RUN-DIR WORKSPACE-DIR RUNTIME [MAX-IDLE-MS] | shard report RUN-DIR [--edn] | shard gesso-inventory [GESSO-ROOT] | shard run --workers N [--scope SCOPE | --inventory COMMAND ARG ...]"))
     (catch FileAlreadyExistsException _
       (binding [*out* *err*] (println "Shard: destination already exists; refusing to overwrite"))
       (System/exit 2))
