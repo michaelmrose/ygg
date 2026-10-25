@@ -702,6 +702,9 @@ if len(argv) >= 2 and argv[0] == 'script/gesso_test.clj':
         if binding != head:
             emit('job:unbound:' + name)
             sys.exit(9)
+        if os.environ.get('SHARD_TEST_FAIL_TARGET') == name:
+            emit('job:failed:' + name)
+            sys.exit(11)
         if os.environ.get('SHARD_TEST_JOB_FAILURE') == '1':
             emit('job:failed:' + name)
             sys.exit(11)
@@ -893,6 +896,138 @@ sys.exit(2)")
         (is (= :failed (:status (edn/read-string
                                (slurp (file (prepared-run-dir fx) "results" "failing.edn"))))))
         (is (not (exists? (file (:project fx) ".ygg" "fake-workers"))))))))
+
+;; v1093: Exercise the actual run supervisor for selected inventories through
+;; disposable Git clones. Gesso and ZFS alone are simulated; immutable basket,
+;; claiming, dependency resolution, worker subprocesses, reports and cleanup
+;; remain the real Shard implementation.
+(defn- scoped-run-data [fx]
+  (let [run (prepared-run-dir fx)
+        output (exec! (:project fx)
+                      [(:bb fx) (:shard fx) "report" (str run) "--edn"] {} 12000)]
+    {:run run
+     :report-exit (:exit output)
+     :report (when (not (str/blank? (:out output)))
+               (try (edn/read-string (:out output)) (catch Exception _ nil)))
+     :manifest (edn/read-string (slurp (file run "jobs.edn")))
+     :source (edn/read-string (slurp (file run "source.edn")))
+     :results (results (assoc fx :run run))}))
+
+(defn- assert-scoped-completion! [fx shims jobs expected]
+  (let [{:keys [run report manifest source results report-exit] :as d}
+        (scoped-run-data fx)
+        events (event-lines shims)
+        ids (set (map :id jobs))]
+    (is (= expected (:overall report)) (pr-str report))
+    (is (= (count jobs) (:total report)))
+    (is (= (count jobs) (:completed report)))
+    (is (= ids (set (map :id (:jobs manifest)))))
+    (is (= ids (set (map :id (vals results)))))
+    (is (= ids (set (map #(.getName %)
+                         (or (.listFiles (file run "claims")) [])))))
+    (is (= (:inventory-sha256 manifest) (:inventory-sha256 report)))
+    (is (= (:inventory-sha256 manifest) (:inventory-sha256 source)))
+    (is (= :passed (get-in source [:preflight :status])))
+    (is (= 1 (count (filter #{"preflight:start"} events))))
+    (is (= 1 (count (filter #{"preflight:passed"} events))))
+    (is (not-any? #(str/starts-with? % "job:unbound:") events))
+    (is (not (exists? (file (:project fx) ".ygg" "fake-workers")))
+        "Complete run must clean its clones")
+    (is (empty? (or (.listFiles (file (:project fx) ".ygg" "workers")) [])))
+    (is (= (if (= expected :pass) 0 1) report-exit))
+    d))
+
+(deftest scoped-full-suite-respects-cross-runtime-dependencies-and-cleans
+  (with-fixture
+    (fn [fx]
+      (let [jobs [(prepared-job "jvm-a" :jvm "gesso.sample-a-test")
+                  (prepared-job "jvm-b" :jvm "gesso.sample-b-test")
+                  (assoc (prepared-job "node-browser" :node:browser "node:browser")
+                         :runtime :node :depends-on ["jvm-a"])
+                  (assoc (prepared-job "themes" :themes "themes")
+                         :depends-on ["node-browser"])]]
+        (prepared-gesso-project! fx {"all" jobs})
+        (let [shims (prepared-shims! fx)
+              response (prepared-run! fx shims "all" {})
+              {:keys [manifest source report]} (assert-scoped-completion! fx shims jobs :pass)
+              events (event-lines shims)]
+          (is (= 0 (:exit response)) (:out response))
+          (is (= "all" (:scope source)))
+          (is (= #{:jvm :node} (set (map :runtime (:jobs manifest)))))
+          (is (= 4 (get-in report [:counts :passed])))
+          (is (every? #(exists? (file (prepared-run-dir fx) "logs"
+                                     (str (:id %) ".log"))) jobs))
+          (is (exists? (file (prepared-run-dir fx) "worker-1.log")))
+          (is (exists? (file (prepared-run-dir fx) "worker-2.log")))
+          (is (< (.indexOf events "preflight:passed")
+                 (.indexOf events "job:started:gesso.sample-a-test")))
+          (is (< (.indexOf events "job:passed:gesso.sample-a-test")
+                 (.indexOf events "job:started:node:browser"))
+              "Dependent Node gate must wait for JVM parent")
+          (is (< (.indexOf events "job:passed:node:browser")
+                 (.indexOf events "job:started:themes"))
+              "Themes must wait for the cross-runtime dependency"))))))
+
+(deftest scoped-jvm-run-does-not-admit-unselected-gates
+  (with-fixture
+    (fn [fx]
+      (let [jvm (mapv (fn [n] (prepared-job (str "jvm-" n) :jvm
+                                            (str "gesso.namespace-" n "-test"))) (range 5))
+            others [(prepared-job "themes" :themes "themes")
+                    (prepared-job "browser" :browser "browser")]]
+        (prepared-gesso-project! fx {"jvm" jvm "all" (into jvm others)})
+        (let [shims (prepared-shims! fx)
+              response (prepared-run! fx shims "jvm" {})
+              {:keys [source report]} (assert-scoped-completion! fx shims jvm :pass)
+              events (event-lines shims)]
+          (is (= 0 (:exit response)) (:out response))
+          (is (= "jvm" (:scope source)))
+          (is (= 5 (get-in report [:counts :passed])))
+          (is (= 1 (count (filter #{"inventory:start:jvm"} events))))
+          (is (not-any? #(or (str/includes? % "themes")
+                             (str/includes? % "browser")) events)))))))
+
+(deftest scoped-single-browser-gate-does-not-schedule-extra-build
+  (with-fixture
+    (fn [fx]
+      (let [only [(prepared-job "integration" :browser:integration "browser:integration")]
+            extra [(prepared-job "advanced" :advanced "advanced")]]
+        (prepared-gesso-project! fx {"browser:integration" only "all" (into extra only)})
+        (let [shims (prepared-shims! fx)
+              response (prepared-run! fx shims "browser:integration" {})
+              {:keys [source manifest]} (assert-scoped-completion! fx shims only :pass)
+              events (event-lines shims)]
+          (is (= 0 (:exit response)) (:out response))
+          (is (= "browser:integration" (:scope source)))
+          (is (= ["integration"] (mapv :id (:jobs manifest))))
+          (is (some #{"job:passed:browser:integration"} events))
+          (is (not-any? #{"job:started:advanced"} events)))))))
+
+(deftest scoped-full-suite-accounts-for-blocked-gates-and-cleans
+  (with-fixture
+    (fn [fx]
+      (let [jobs [(prepared-job "independent" :jvm "gesso.independent-test")
+                  (assoc (prepared-job "failing" :node:browser "node:browser")
+                         :runtime :node)
+                  (assoc (prepared-job "dependent" :themes "themes")
+                         :depends-on ["failing"])]]
+        (prepared-gesso-project! fx {"all" jobs})
+        (let [shims (prepared-shims! fx)
+              response (prepared-run! fx shims "all"
+                                      {"SHARD_TEST_FAIL_TARGET" "node:browser"})
+              {:keys [results report]} (assert-scoped-completion! fx shims jobs :fail)
+              events (event-lines shims)]
+          (is (= 1 (:exit response)) (:out response))
+          (is (= :passed (get-in results ["independent.edn" :status])))
+          (is (= :failed (get-in results ["failing.edn" :status])))
+          (is (= :blocked (get-in results ["dependent.edn" :status])))
+          (is (= ["failing"] (get-in results ["dependent.edn" :blocked-by])))
+          (is (= 1 (get-in report [:counts :failed])))
+          (is (= 1 (get-in report [:counts :blocked])))
+          (is (some #{"job:failed:node:browser"} events))
+          (is (not-any? #{"job:started:themes"} events))
+          (is (str/includes? (:out response) "SHARD CLEANED")
+              "Terminal failures must not prevent safe cleanup"))))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
