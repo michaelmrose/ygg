@@ -1029,6 +1029,195 @@ sys.exit(2)")
           (is (str/includes? (:out response) "SHARD CLEANED")
               "Terminal failures must not prevent safe cleanup"))))))
 
+;; JVM timing reporting is advisory: it must never alter result validity,
+;; the overall exit status, or the historical schedule's input requirements.
+;; These fixtures exercise the *real* Shard report command and job logs.
+(defn- timing-record [ns-name wall launch testing shutdown]
+  ;; Array-map deliberately prints the required prefix first: Shard accepts
+  ;; only standalone EDN records, not arbitrary fragments in ordinary output.
+  (pr-str (array-map
+            :gesso/jvm-timing 1
+            :namespace ns-name
+            :wall-ms wall
+            :launch-to-testing-ms launch
+            :testing-to-summary-ms testing
+            :summary-to-exit-ms shutdown
+            :method :stdout-milestones)))
+
+(defn- output-command [lines exit-code]
+  ["bash" "-c"
+   (str "cat <<'SHARD_TIMING_FIXTURE_EOF'\n"
+        (str/join "\n" lines)
+        "\nSHARD_TIMING_FIXTURE_EOF\nexit " exit-code "\n")])
+
+(defn- timed-namespace-job
+  ([id ns-name lines] (timed-namespace-job id ns-name lines 0))
+  ([id ns-name lines exit-code]
+   (assoc (job id (output-command lines exit-code))
+          :gate :jvm
+          :unit {:type :gesso-jvm-namespace :name ns-name})))
+
+(defn- timing-report! [fx]
+  (let [r (report fx)]
+    (is (map? (:edn r)) (:out r))
+    r))
+
+(deftest timing-summary-aggregates-only-passed-jvm-namespaces
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx
+                  [(timed-namespace-job
+                     "a" "gesso.a-test"
+                     ["unrelated output"
+                      (timing-record "gesso.a-test" 101 70 20 10)])
+                   (timed-namespace-job
+                     "b" "gesso.b-test"
+                     [(timing-record "gesso.b-test" 202 100 80 21)])
+                   (timed-namespace-job "c" "gesso.c-test" ["ordinary test output"])
+                   (timed-namespace-job
+                     "d" "gesso.d-test"
+                     [(timing-record "gesso.other-test" 400 200 100 100)])
+                   (timed-namespace-job
+                     "e-failed" "gesso.e-test"
+                     [(timing-record "gesso.e-test" 900 700 100 100)] 9)
+                   (assoc (job "f-other-gate"
+                               (output-command
+                                 [(timing-record "gesso.f-test" 800 600 100 100)] 0))
+                          :gate :browser
+                          :unit {:type :gesso-gate :name "browser"})])
+      (is (= 0 (:exit (worker fx))))
+      (let [{:keys [exit edn]} (timing-report! fx)
+            t (:jvm-timing edn)]
+        (is (= 1 exit) "A failed job must still make the report fail")
+        (is (= :fail (:overall edn)))
+        (is (= 6 (:total edn)))
+        (is (= 5 (get-in edn [:counts :passed])))
+        (is (= 1 (get-in edn [:counts :failed])))
+        (is (= 4 (:eligible t)) "Exclude both failed and unrelated jobs")
+        (is (= 2 (:measured t)))
+        (is (= ["c"] (:missing t)))
+        (is (= ["d"] (:invalid t)))
+        (is (= {:wall-ms 303
+                :launch-to-testing-ms 170
+                :testing-to-summary-ms 100
+                :summary-to-exit-ms 31}
+               (:totals-ms t)))
+        (is (= ["b" "a"] (mapv :id (:slowest t))))
+        (is (= ["gesso.b-test" "gesso.a-test"]
+               (mapv :namespace (:slowest t))))
+        (is (every? #(not (contains? (set (map :id (:slowest t))) %))
+                    ["c" "d" "e-failed" "f-other-gate"]))))))
+
+(deftest timing-summary-rejects-corrupt-duplicate-and-untrusted-evidence
+  (with-fixture
+    (fn [fx]
+      (let [good-ns "gesso.sample-test"
+            valid (timing-record good-ns 30 10 10 10)
+            entries
+            [["duplicate" [valid valid]]
+             ["bad-edn" ["{:gesso/jvm-timing ?broken"]]
+             ["negative" [(timing-record good-ns 30 -1 20 10)]]
+             ["inconsistent" [(timing-record good-ns 30 10 10 5)]]
+             ["wrong-method" [(str/replace valid ":stdout-milestones"
+                                                    ":unsupported")]]
+             ["extra-field" [(str/replace valid "}" ", :surprise true}")]]
+             ["overlong" [(str valid (apply str (repeat 2050 "x")))]]
+             ["non-record" [(str "prefix " valid)]]]]
+        (enumerate! fx
+                    (mapv (fn [[id lines]]
+                            (timed-namespace-job id good-ns lines))
+                          entries))
+        (is (= 0 (:exit (worker fx))))
+        (let [{:keys [exit edn]} (timing-report! fx)
+              t (:jvm-timing edn)]
+          (is (= 0 exit) "Invalid advisory evidence cannot fail passing jobs")
+          (is (= :pass (:overall edn)))
+          (is (= 8 (:eligible t)))
+          (is (zero? (:measured t)))
+          (is (= ["non-record"] (:missing t)))
+          (is (= (set (map first (remove #(= "non-record" (first %)) entries)))
+                 (set (:invalid t))))
+          (is (zero? (get-in t [:totals-ms :wall-ms])))
+          (is (empty? (:slowest t))))))))
+
+(deftest timing-summary-orders-top-ten-by-wall-time-then-job-id
+  (with-fixture
+    (fn [fx]
+      (let [values {"j00" 40, "j01" 500, "j02" 15, "j03" 300
+                    "j04" 90, "j05" 600, "j06" 1, "j07" 300
+                    "j08" 100, "j09" 5, "j10" 700, "j11" 400
+                    "j12" 10}
+            expected (->> values
+                          (sort-by (fn [[id wall]] [(- wall) id]))
+                          (take 10) (mapv first))]
+        (enumerate! fx
+                    (mapv (fn [[id wall]]
+                            (timed-namespace-job
+                              id (str "gesso." id "-test")
+                              [(timing-record (str "gesso." id "-test")
+                                              wall wall 0 0)]))
+                          values))
+        (is (= 0 (:exit (worker fx))))
+        (let [{:keys [exit edn]} (timing-report! fx)
+              t (:jvm-timing edn)
+              human (invoke fx "report" (str (:run fx)))]
+          (is (zero? exit))
+          (is (= :pass (:overall edn)))
+          (is (= 13 (:eligible t) (:measured t)))
+          (is (empty? (:missing t)))
+          (is (empty? (:invalid t)))
+          (is (= (reduce + (vals values))
+                 (get-in t [:totals-ms :wall-ms])))
+          (is (= expected (mapv :id (:slowest t))))
+          (is (= 10 (count (:slowest t))))
+          (is (= ["j03" "j07"]
+                 (->> (:slowest t) (filter #(= 300 (:wall-ms %)))
+                      (mapv :id))))
+          (is (zero? (:exit human)))
+          (is (str/includes? (:out human) "JVM timing"))
+          (is (str/includes? (:out human) "13 / 13 measured"))
+          (is (= 5 (count (re-seq #"Slow JVM:" (:out human)))))
+          (is (str/includes? (:out human) "j10"))
+          (is (not (str/includes? (:out human) "Slow JVM: j02 "))))))))
+
+(deftest timing-summary-does-not-reinterpret-incomplete-runs
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx
+                  [(timed-namespace-job
+                     "a-passed" "gesso.a-test"
+                     [(timing-record "gesso.a-test" 23 10 10 3)])
+                   (timed-namespace-job
+                     "b-unfinished" "gesso.b-test"
+                     [(timing-record "gesso.b-test" 100 50 40 10)])])
+      (is (.mkdir (file (:run fx) "claims" "b-unfinished")))
+      (is (= 0 (:exit (worker fx))))
+      (let [{:keys [exit edn]} (timing-report! fx)
+            t (:jvm-timing edn)]
+        (is (= 1 exit))
+        (is (= :incomplete (:overall edn)))
+        (is (= 1 (:completed edn)))
+        (is (= 1 (get-in edn [:counts :claimed-without-result])))
+        (is (= 1 (:eligible t) (:measured t)))
+        (is (= 23 (get-in t [:totals-ms :wall-ms])))
+        (is (= ["a-passed"] (mapv :id (:slowest t))))))))
+
+(deftest timing-reporting-is-deterministic-and-read-only
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx [(timed-namespace-job
+                        "one" "gesso.one-test"
+                        [(timing-record "gesso.one-test" 17 5 10 2)])])
+      (is (= 0 (:exit (worker fx))))
+      (let [before (slurp (file (:run fx) "results" "one.edn"))
+            first (timing-report! fx)
+            second (timing-report! fx)]
+        (is (= 0 (:exit first) (:exit second)))
+        (is (= (:edn first) (:edn second)))
+        (is (= before (slurp (file (:run fx) "results" "one.edn"))))
+        (is (= :pass (get-in first [:edn :overall])))
+        (is (= 1 (get-in first [:edn :jvm-timing :measured])))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
