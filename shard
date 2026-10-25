@@ -21,7 +21,8 @@
         '[java.time Instant]
         [java.util UUID]
         [java.util.concurrent TimeUnit]
-        [java.lang ProcessBuilder ProcessBuilder$Redirect])
+        [java.lang ProcessBuilder ProcessBuilder$Redirect]
+        [java.net InetAddress ServerSocket Socket])
 
 (def ^:private id-pattern #"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 (def ^:private no-attributes (make-array FileAttribute 0))
@@ -387,10 +388,9 @@
            (try (.removeShutdownHook runtime hook)
                 (catch IllegalStateException _ nil))))))
 
-;; Child test commands must not write into a shared host home or temporary
-;; directory. Each worker owns private writable paths within its ZFS clone.
-;; This is filesystem hygiene, not a sandbox: external services, sockets and
-;; explicitly configured absolute paths remain shared host resources.
+;; Private worker paths are writable exclusively inside the worker clone.
+;; Each claimed job is also executed in a mandatory Bubblewrap sandbox with
+;; independent network, PID and mount namespaces; see sandbox-command below.
 (def ^:private worker-env-no-follow
   (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
 (def ^:private worker-private-permissions
@@ -449,11 +449,94 @@
            (str existing " "))
          "-Djava.io.tmpdir=" quoted)))
 
+;; Keep the scheduler, claims, logs and process-group supervision OUTSIDE
+;; Bubblewrap. Each job gets a fresh network namespace. Because a worker runs
+;; at most one job at a time, concurrently executing jobs can never share
+;; localhost ports, even when workers run the same integration gate.
+;; The outer `setsid` is deliberately outside bwrap: its host PID/PGID can be
+;; recorded and verified against the supervisor's host /proc.
+(defn- namespace-id! [name]
+  (str (Files/readSymbolicLink (.toPath (io/file "/proc/self/ns" name)))))
+
+(defn- sandbox-command [^java.io.File workspace command]
+  (let [path (.getCanonicalPath workspace)]
+    (into ["bwrap"
+           "--unshare-user" "--unshare-ipc" "--unshare-pid" "--unshare-net"
+           "--die-with-parent"
+           ;; Files outside the verified ZFS clone are read-only. In
+           ;; particular, the Shard basket cannot be written by test jobs.
+           "--ro-bind" "/" "/"
+           "--bind" path path
+           "--proc" "/proc" "--dev" "/dev"
+           "--chdir" path "--"]
+          command)))
+
+(defn- verify-sandbox-probe! [parent-net parent-pid parent-mnt]
+  (require! (every? #(and (string? %) (re-matches #"[a-z]+:\[[0-9]+\]" %))
+                   [parent-net parent-pid parent-mnt])
+            "Invalid sandbox probe namespace identities")
+  (doseq [[name expected] [["net" parent-net] ["pid" parent-pid]
+                           ["mnt" parent-mnt]]]
+    (require! (not= expected (namespace-id! name))
+              "Bubblewrap did not isolate the required namespace"
+              {:namespace name}))
+  ;; Bubblewrap initializes lo itself. A successful bind alone is NOT proof
+  ;; that loopback can transport traffic; require a real connect/accept.
+  (let [loopback (InetAddress/getByName "127.0.0.1")]
+    (with-open [server (ServerSocket. 0 1 loopback)]
+      (.setSoTimeout server 2000)
+      (with-open [client (Socket.)]
+        (.connect client (java.net.InetSocketAddress.
+                           loopback (.getLocalPort server)) 2000)
+        (with-open [accepted (.accept server)]
+          (require! (.isConnected accepted)
+                    "Sandbox loopback transport is not functional")))))
+  (println "SHARD SANDBOX PROBE OK")
+  (flush))
+
+(defn- sandbox-preflight! [^java.io.File workspace]
+  ;; This is run before ZFS clone creation for `shard run`, and before any
+  ;; claims for a standalone `shard worker`. A missing/blocked bwrap or a
+  ;; broken private loopback must never fall back to host-network execution.
+  (let [script (let [file (.getCanonicalFile
+                             (io/file (System/getProperty "babashka.file")))]
+                 (require! (.isFile file) "Cannot locate Shard sandbox probe")
+                 (if (.canExecute file)
+                   [(.getPath file)]
+                   ["bb" (.getPath file)]))
+        argv (sandbox-command workspace
+               (into script ["sandbox-probe" (namespace-id! "net")
+                             (namespace-id! "pid") (namespace-id! "mnt")]))
+        log (Files/createTempFile "shard-bwrap-preflight-" ".log"
+                                  (make-array FileAttribute 0))
+        builder (ProcessBuilder. ^java.util.List argv)]
+    (.directory builder workspace)
+    (.redirectErrorStream builder true)
+    (.redirectOutput builder (ProcessBuilder$Redirect/to (.toFile log)))
+    (try
+      (let [p (try (.start builder)
+                   (catch Exception ex
+                     (fail! "Bubblewrap unavailable; no jobs or clones started"
+                            {:cause (.getMessage ex)})))
+            finished? (.waitFor p 15 TimeUnit/SECONDS)]
+        (when-not finished?
+          (.destroyForcibly p)
+          (.waitFor p 3 TimeUnit/SECONDS))
+        (let [output (Files/readString log)]
+          (require! (and finished? (zero? (.exitValue p))
+                         (str/includes? output "SHARD SANDBOX PROBE OK"))
+                    "Bubblewrap namespace/localhost probe failed; refusing unsandboxed jobs"
+                    {:exit (if finished? (.exitValue p) :timeout)
+                     :diagnostic (subs output 0 (min 1500 (count output)))}))
+        true)
+      (finally (Files/deleteIfExists log)))))
+
 (defn- execute! [run job ^java.io.File workspace ^java.io.File logfile worker-env]
   ;; Run every test in a distinct Linux process session. Record its PGID in
   ;; the run basket; neither a successful exit nor a supervisor signal proves
   ;; that detached descendants have stopped.
-  (let [argv (into ["setsid" "--wait" "--"] (:command job))
+  (let [argv (into ["setsid" "--wait" "--"]
+                   (sandbox-command workspace (:command job)))
         builder (ProcessBuilder. ^java.util.List argv)
         env (.environment builder)
         start (System/nanoTime)]
@@ -563,6 +646,7 @@
                     "Run basket must be outside the execution workspace")
         _ (require! (and (integer? max-idle) (<= 0 max-idle 86400000))
                     "MAX-IDLE-MS must be between 0 and 86400000")
+        _ (sandbox-preflight! workspace)
         worker-id (str (UUID/randomUUID))
         worker-env (create-worker-environment! workspace worker-id)
         allowed (filterv #(= runtime (:runtime %)) (:jobs manifest))
@@ -1500,6 +1584,9 @@
                      "ONCE" (:duration-ms preflight) "ms"))
           (println "SHARD PREPARED" (:job-count preparation) "jobs")
           (flush)
+          (sandbox-preflight! root)
+          (println "SHARD SANDBOX READY" "bubblewrap net/pid/mount localhost")
+          (flush)
           (command! root ["ygg" "-n" (str (:workers opts)) "create"])
           (let [outcome
                 (with-workers-lock! root
@@ -1549,6 +1636,12 @@
 (defn -main [& args]
   (try
     (case (first args)
+      "sandbox-probe"
+      (let [[_ parent-net parent-pid parent-mnt & trailing] args]
+        (require! (and parent-net parent-pid parent-mnt (empty? trailing))
+                  "Internal sandbox probe requires namespace identities")
+        (verify-sandbox-probe! parent-net parent-pid parent-mnt))
+
       "enumerate"
       (let [[_ config-path run-dir & trailing] args]
         (require! (and config-path run-dir (empty? trailing))
