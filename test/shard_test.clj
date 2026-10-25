@@ -1745,33 +1745,174 @@ sys.exit(2)")
                    (slurp (file workspace "http-verified"))))))
         (is (= :pass (get-in (report fx) [:edn :overall])))))))
 
-(defn- chromium-smoke-pass? [fx]
-  (let [out (file (:base fx) "chrome-smoke")
-        binary (or (System/getenv "SHARD_TEST_CHROMIUM") "chromium")
-        cmd ["timeout" "8" binary "--headless=new" "--no-sandbox"
-             "--disable-gpu" "--disable-dev-shm-usage"
-             "--disable-background-networking" "--no-first-run"
-             (str "--user-data-dir=" (.getAbsolutePath out))
-             "--dump-dom" "data:text/html,<h1>SHARD-CHROME-SMOKE</h1>"]
-        response (exec! (:project fx) cmd {} 11000)]
-    (and (= 0 (:exit response))
-         (str/includes? (:out response) "SHARD-CHROME-SMOKE"))))
-
 (deftest sandbox-private-localhost-simultaneous-http-htmx-and-sse-transport
   (with-fixture
     (fn [fx]
       (browser-integration-two-workers! fx "transport"))))
 
-(deftest sandbox-chromium-htmx-and-sse-concurrent-worker-integration
-  (with-fixture
-    (fn [fx]
-      (let [required? (= "1" (System/getenv "SHARD_TEST_REQUIRE_CHROMIUM"))
-            smoke? (chromium-smoke-pass? fx)]
-        (if (or required? smoke?)
-          (do
-            (is smoke? "Chromium must complete a real headless DOM smoke test")
-            (when smoke? (browser-integration-two-workers! fx "browser")))
-          (println "SKIP Chromium HTMX/SSE browser test: headless DOM smoke failed; set SHARD_TEST_REQUIRE_CHROMIUM=1 to require it"))))))
+;; v1105: real Gesso Playwright is the authoritative browser integration gate.
+;; The v1103 standalone Chromium fixture only probes the transport layer.
+;; This deliberately opt-in, *native* Bubblewrap test checks Gesso's real
+;; advanced build + Playwright Chromium + HTMX/SSE integration twice in parallel.
+;; It does not modify the supplied Gesso checkout: each job gets an independent
+;; disposable Git clone, with matching preflight-admitted HEAD and an independent
+;; private net/PID/mount namespace. The Gesso checkout must have all requisite
+;; Maven/Git dependencies already cached: a worker has no external network.
+;;
+;; Run from Ygg/Shard with:
+;;   SHARD_TEST_GESSO_ROOT=/absolute/path/to/gesso \
+;;   SHARD_TEST_REQUIRE_PLAYWRIGHT=1 bb test
+;; Without SHARD_TEST_GESSO_ROOT this test is explicitly skipped. With the
+;; variable set any missing native bwrap, failing Playwright/Chromium, failure
+;; to create clones, or incomplete job MUST fail; no shim or --dump-dom fallback.
+(defn- native-bwrap-path []
+  (some (fn [candidate]
+          (let [f (file candidate)]
+            (when (and (.isFile f) (.canExecute f))
+              (.getCanonicalPath f))))
+        ["/usr/bin/bwrap" "/bin/bwrap"]))
+
+(defn- checked-test-command! [root args env max-ms]
+  (let [r (exec! root args env max-ms)]
+    (when-not (= 0 (:exit r))
+      (throw (ex-info (str "Command failed: " (pr-str args) "\n" (:out r))
+                      {:command args :exit (:exit r)})))
+    r))
+
+(defn- clone-gesso-for-playwright! [fx src dest]
+  ;; Use genuine Git clones, not worktrees. That avoids touching the original
+  ;; checkout's .git/worktrees, index, compiled resources or local branch.
+  (checked-test-command!
+    (:project fx)
+    ["git" "clone" "--quiet" "--local" "--no-hardlinks" "--no-checkout"
+     (.getCanonicalPath (file src)) (.getCanonicalPath (file dest))]
+    {} 180000)
+  (let [head (str/trim (:out (checked-test-command!
+                               src ["git" "rev-parse" "HEAD"] {} 10000)))]
+    (checked-test-command! dest ["git" "checkout" "--quiet" "--detach" head]
+                           {} 180000)
+    (when-not (= head (str/trim (:out (checked-test-command!
+                                      dest ["git" "rev-parse" "HEAD"] {} 10000))))
+      (throw (ex-info "Disposable clone HEAD differs from source" {:expected head})))
+    head))
+
+(deftest native-bubblewrap-runs-existing-gesso-playwright-in-two-workers
+  (let [supplied (some-> (System/getenv "SHARD_TEST_GESSO_ROOT") str/trim not-empty)
+        required? (= "1" (System/getenv "SHARD_TEST_REQUIRE_PLAYWRIGHT"))]
+    (if-not supplied
+      (if required?
+        (is false "SHARD_TEST_REQUIRE_PLAYWRIGHT=1 requires SHARD_TEST_GESSO_ROOT")
+        (println "SKIP real Gesso Playwright: set SHARD_TEST_GESSO_ROOT to opt in"))
+      (with-fixture
+        (fn [fx]
+          (let [root (.getCanonicalFile (file supplied))
+                native (native-bwrap-path)
+                ws-a (:workspace fx)
+                ws-b (file (:base fx) "gesso-browser-worker-b")
+                resolved-bb (resolved-test-bb! fx)]
+            (is (.isDirectory root) (str "Gesso checkout not found: " root))
+            (is (some? native) "Native /usr/bin/bwrap or /bin/bwrap is required; shims are forbidden")
+            (is (.isFile (file root "script" "gesso_test.clj"))
+                "Gesso must contain its existing real-browser integration runner")
+            (when (and native (.isDirectory root)
+                       (.isFile (file root "script" "gesso_test.clj")))
+              (let [clean (checked-test-command!
+                            root ["git" "status" "--porcelain" "--untracked-files=no"] {} 12000)]
+                (when-not (str/blank? (:out clean))
+                  (throw (ex-info "Real Gesso Playwright test requires a clean tracked checkout"
+                                  {:git-status (:out clean)}))))
+              ;; Always use the *real* bwrap, never the namespace-only test shim.
+              (Files/createSymbolicLink (.toPath (file (:bin fx) "bwrap"))
+                                       (.toPath (file native)) attrs)
+              (Files/createSymbolicLink (.toPath (file (:bin fx) "bb"))
+                                       (.toPath (file resolved-bb)) attrs)
+              (let [head-a (clone-gesso-for-playwright! fx root ws-a)
+                    head-b (clone-gesso-for-playwright! fx root ws-b)
+                    env {"PATH" (str (.getAbsolutePath (:bin fx))
+                                     java.io.File/pathSeparator
+                                     (System/getenv "PATH"))
+                         "PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD" "1"
+                         "GESSO_SHARD_PREFLIGHT_COMMIT" head-a}
+                    ;; Gesso's actual preflight is the only authority that may
+                    ;; admit these prepared test jobs. Run it exactly once,
+                    ;; before either worker is allowed to claim a job.
+                    check (checked-test-command!
+                            ws-a [resolved-bb "script/gesso_test.clj" "preflight"]
+                            env 180000)]
+                (when-not (= head-a head-b)
+                  (throw (ex-info "Both clones must match preflighted source"
+                                  {:first head-a :second head-b})))
+                (is (zero? (:exit check)) "Gesso integrity preflight must pass")
+                ;; This barrier proves concurrent admission/execution rather
+                ;; than merely letting two expensive jobs run sequentially.
+                (let [command ["bash" "-c"
+                               (str "readlink /proc/self/ns/net > playwright-net-id; "
+                                    "readlink /proc/self/ns/pid > playwright-pid-id; "
+                                    "readlink /proc/self/ns/mnt > playwright-mnt-id; "
+                                    "touch playwright-ready; "
+                                    "until test -f playwright-go; do sleep .1; done; "
+                                    "exec bb script/gesso_test.clj "
+                                    "gate:prepared browser:integration")]
+                      jobs [(assoc (job "playwright-a" command)
+                                   :gate :browser:integration
+                                   :unit {:type :gate}
+                                   :timeout-ms 900000)
+                            (assoc (job "playwright-b" command)
+                                   :gate :browser:integration
+                                   :unit {:type :gate}
+                                   :timeout-ms 900000)]
+                      _ (enumerate! fx jobs)
+                      started (mapv (fn [workspace]
+                                      (start-cli!
+                                        fx (:project fx)
+                                        [resolved-bb (:shard fx) "worker"
+                                         (str (:run fx)) (str workspace) "jvm" "250"]
+                                        env))
+                                    [ws-a ws-b])]
+                  (let [both-ready? (atom false)]
+                    (try
+                      (let [ready-a (await-file! (file ws-a "playwright-ready") 45000)
+                            ready-b (await-file! (file ws-b "playwright-ready") 45000)]
+                        (is ready-a "First real Gesso worker must enter its sandbox")
+                        (is ready-b "Second worker must enter its own sandbox concurrently")
+                        (when (and ready-a ready-b)
+                          (doseq [name ["net" "pid" "mnt"]]
+                            (let [a (str/trim (slurp (file ws-a (str "playwright-" name "-id"))))
+                                  b (str/trim (slurp (file ws-b (str "playwright-" name "-id"))))]
+                              (is (re-matches #"[a-z]+:\[[0-9]+\]" a)
+                                  (str "Invalid first " name " namespace"))
+                              (is (re-matches #"[a-z]+:\[[0-9]+\]" b)
+                                  (str "Invalid second " name " namespace"))
+                              (is (not= a b)
+                                  (str "Workers must not share the " name " namespace"))))
+                          (reset! both-ready? true)))
+                      (finally
+                        (if @both-ready?
+                          (do
+                            (spit (file ws-a "playwright-go") "go")
+                            (spit (file ws-b "playwright-go") "go")
+                            (doseq [started-worker started]
+                              (let [done (finish-cli! started-worker 940000)]
+                                (is (= 0 (:exit done)) (:out done)))))
+                          ;; Do not start two costly real-browser jobs if the
+                          ;; sandbox overlap barrier failed.
+                          (doseq [started-worker started]
+                            (terminate-cli! started-worker))))))
+                  (let [outcomes (results fx)
+                        summary (report fx)]
+                    (is (= #{"playwright-a.edn" "playwright-b.edn"}
+                           (set (keys outcomes))))
+                    (is (every? #(= :passed (:status %)) (vals outcomes))
+                        (pr-str outcomes))
+                    (is (= 0 (:exit summary)) (:out summary))
+                    (is (= :pass (get-in summary [:edn :overall])))
+                    (doseq [id ["playwright-a" "playwright-b"]]
+                      (let [log (file (:run fx) "logs" (str id ".log"))]
+                        (is (.isFile log) (str "Missing real-browser log " id))
+                        (when (.isFile log)
+                          (is (str/includes? (slurp log)
+                                             "Production runtime / real Chromium integration: PASS")
+                              (str "Real Gesso Playwright integration not proven: " id)))))))))))))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
