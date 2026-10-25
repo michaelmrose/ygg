@@ -424,6 +424,11 @@
         config (worker-env-directory! unique "config" true)
         data (worker-env-directory! unique "data" true)
         state (worker-env-directory! unique "state" true)
+        runtime (worker-env-directory! unique "runtime" true)
+        ;; Mountpoints for read-only, pre-populated host dependency caches.
+        ;; They must be real directories (never user-controlled symlinks).
+        _ (doseq [cache-name [".m2" ".gitlibs" ".clojure"]]
+            (worker-env-directory! home cache-name true))
         path (fn [f] (.getAbsolutePath ^java.io.File f))]
     {"SHARD_WORKER_ENV_ROOT" (path unique)
      "SHARD_WORKER_TMP" (path tmp)
@@ -434,20 +439,24 @@
      "XDG_CACHE_HOME" (path cache)
      "XDG_CONFIG_HOME" (path config)
      "XDG_DATA_HOME" (path data)
-     "XDG_STATE_HOME" (path state)}))
+     "XDG_STATE_HOME" (path state)
+     "XDG_RUNTIME_DIR" (path runtime)}))
 
-(defn- java-tool-options-for-worker [existing tmp]
+(defn- java-tool-options-for-worker [existing tmp home]
   ;; JAVA_TOOL_OPTIONS reaches Java processes launched by shell scripts, Clojure
   ;; CLI and other nested tools. Preserve the caller's other JVM options.
   ;; Quoting protects paths containing spaces; newlines are unsafe in options.
-  (require! (not (re-find #"[\r\n]" tmp))
-            "Worker temp path cannot contain newlines")
-  (let [quoted (str "\"" (-> tmp
-                               (str/replace "\\" "\\\\")
-                               (str/replace "\"" "\\\"")) "\"")]
+  (doseq [[label path] [["Worker temp" tmp] ["Worker home" home]]]
+    (require! (and (string? path) (not (re-find #"[\r\n]" path)))
+              (str label " path cannot contain newlines")))
+  (let [quoted (fn [value]
+                 (str "\"" (-> value
+                                   (str/replace "\\" "\\\\")
+                                   (str/replace "\"" "\\\"")) "\""))]
     (str (when (and existing (not (str/blank? existing)))
            (str existing " "))
-         "-Djava.io.tmpdir=" quoted)))
+         "-Djava.io.tmpdir=" (quoted tmp)
+         " -Duser.home=" (quoted home))))
 
 ;; Keep the scheduler, claims, logs and process-group supervision OUTSIDE
 ;; Bubblewrap. Each job gets a fresh network namespace. Because a worker runs
@@ -458,18 +467,55 @@
 (defn- namespace-id! [name]
   (str (Files/readSymbolicLink (.toPath (io/file "/proc/self/ns" name)))))
 
-(defn- sandbox-command [^java.io.File workspace command]
-  (let [path (.getCanonicalPath workspace)]
-    (into ["bwrap"
-           "--unshare-user" "--unshare-ipc" "--unshare-pid" "--unshare-net"
-           "--die-with-parent"
-           ;; Files outside the verified ZFS clone are read-only. In
-           ;; particular, the Shard basket cannot be written by test jobs.
-           "--ro-bind" "/" "/"
-           "--bind" path path
-           "--proc" "/proc" "--dev" "/dev"
-           "--chdir" path "--"]
-          command)))
+;; Gesso's existing Clojure CLI and Playwright Java tests should use the
+;; dependencies that the user has already fetched, without granting two
+;; workers shared *writable* Maven or Git checkouts. Cache misses must fail
+;; visibly in the offline network namespace; never silently use host network.
+(def ^:private dependency-cache-names [".m2" ".gitlibs" ".clojure"])
+
+(defn- read-only-cache-mounts [worker-env]
+  (if-not worker-env
+    []
+    (let [host-home (io/file (or (System/getenv "HOME")
+                                 (System/getProperty "user.home")))
+          private-home (io/file (get worker-env "HOME"))]
+      (require! (.isDirectory host-home) "Host dependency home unavailable")
+      (vec
+       (mapcat
+        (fn [name]
+          (let [source (.toPath (io/file host-home name))
+                target (.toPath (io/file private-home name))]
+            (require! (Files/isDirectory target worker-env-no-follow)
+                      "Unsafe dependency cache destination" {:path (str target)})
+            (if (Files/exists source worker-env-no-follow)
+              (do
+                (require! (Files/isDirectory source worker-env-no-follow)
+                          "Unsafe host dependency cache (symlink or non-directory)"
+                          {:path (str source)})
+                ["--ro-bind" (str source) (str target)])
+              [])))
+        dependency-cache-names)))))
+
+(defn- sandbox-command
+  ([^java.io.File workspace command]
+   (sandbox-command workspace command nil))
+  ([^java.io.File workspace command worker-env]
+   (let [path (.getCanonicalPath workspace)]
+     (into (into ["bwrap"
+                  "--unshare-user" "--unshare-ipc" "--unshare-pid" "--unshare-net"
+                  "--die-with-parent"
+                  ;; Files outside the verified ZFS clone are read-only.
+                  "--ro-bind" "/" "/"
+                  ;; /tmp must be private, but mount it before the verified
+                  ;; clone so repositories under /tmp remain accessible.
+                  "--tmpfs" "/tmp"
+                  "--bind" path path
+                  "--proc" "/proc" "--dev" "/dev"
+                  ;; Chromium and the Playwright driver need writable scratch
+                  ;; paths even when they do not honor TMPDIR.
+                  "--dir" "/dev/shm" "--tmpfs" "/dev/shm"]
+                 (read-only-cache-mounts worker-env))
+           (into ["--chdir" path "--"] command)))))
 
 (defn- verify-sandbox-probe! [parent-net parent-pid parent-mnt]
   (require! (every? #(and (string? %) (re-matches #"[a-z]+:\[[0-9]+\]" %))
@@ -536,7 +582,7 @@
   ;; the run basket; neither a successful exit nor a supervisor signal proves
   ;; that detached descendants have stopped.
   (let [argv (into ["setsid" "--wait" "--"]
-                   (sandbox-command workspace (:command job)))
+                   (sandbox-command workspace (:command job) worker-env))
         builder (ProcessBuilder. ^java.util.List argv)
         env (.environment builder)
         start (System/nanoTime)]
@@ -546,7 +592,8 @@
     (.putAll env worker-env)
     (.put env "JAVA_TOOL_OPTIONS"
           (java-tool-options-for-worker (.get env "JAVA_TOOL_OPTIONS")
-                                        (get worker-env "TMPDIR")))
+                                        (get worker-env "TMPDIR")
+                                        (get worker-env "HOME")))
     (.put env "SHARD_JOB_ID" (:id job))
     (.put env "SHARD_WORKSPACE" (.getCanonicalPath workspace))
     (try
@@ -649,6 +696,8 @@
         _ (sandbox-preflight! workspace)
         worker-id (str (UUID/randomUUID))
         worker-env (create-worker-environment! workspace worker-id)
+        ;; Reject unsafe external cache paths before claiming a single job.
+        _ (read-only-cache-mounts worker-env)
         allowed (filterv #(= runtime (:runtime %)) (:jobs manifest))
         preferred (when schedule-index
                     (schedule-for-worker! run manifest runtime schedule-index))
