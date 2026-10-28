@@ -1,4 +1,4 @@
-{:paths ["test"]
+{:paths ["src" "test"]
  :tasks
  {test
   {:doc "Run all Ygg/Shard test namespaces with Babashka."
