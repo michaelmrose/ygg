@@ -21,6 +21,7 @@
             [shard.protocol :as protocol]
             [shard.runtime.admission :as admission])
   (:import [java.io File InputStream OutputStream]
+           [java.nio.charset StandardCharsets]
            [java.net StandardProtocolFamily UnixDomainSocketAddress]
            [java.nio.channels Channels ServerSocketChannel SocketChannel]
            [java.nio.file Files Path LinkOption]
@@ -275,6 +276,42 @@
                     "JVM result was attributed to a different namespace"))
   reply)
 
+(def ^:private unix-socket-path-max-bytes
+  ;; Linux sockaddr_un.sun_path is 108 bytes including the NUL terminator.
+  ;; Reject addresses longer than 107 UTF-8 bytes before attempting bind.
+  107)
+
+(defn- socket-address!
+  "Choose a socket pathname visible to BOTH the host and the child JVM.
+
+  The absolute clone path may be arbitrarily deep and is often longer than
+  sockaddr_un permits. A pathname relative to the clone is safe ONLY when
+  the host process's real cwd is that clone: ProcessBuilder and Bubblewrap
+  both launch the JVM with that same cwd. Never use a symlink alias or place
+  the control socket in host /tmp (the sandbox has private /tmp)."
+  [^Path socket ^Path cwd]
+  (let [absolute (str socket)
+        byte-length (fn [s] (alength (.getBytes ^String s StandardCharsets/UTF_8)))]
+    (cond
+      (<= (byte-length absolute) unix-socket-path-max-bytes)
+      absolute
+
+      ;; The worker process is launched from its owned clone. Verify rather
+      ;; than assume that property; tests sometimes launch from elsewhere.
+      (and (.startsWith socket cwd)
+           (Files/isSameFile cwd (Path/of "." (make-array String 0)))
+           (<= (byte-length (str (.relativize cwd socket)))
+               unix-socket-path-max-bytes))
+      (str (.relativize cwd socket))
+
+      :else
+      (refuse! :socket-path-too-long
+               "Unix control socket pathname exceeds Linux's 107-byte limit"
+               {:absolute-path absolute
+                :absolute-bytes (byte-length absolute)
+                :relative-bytes (when (.startsWith socket cwd)
+                                  (byte-length (str (.relativize cwd socket))))}))))
+
 (defn start!
   "Start one persistent JVM with an explicit trust boundary.
 
@@ -333,7 +370,7 @@
                                      :admission-changed
                                      "Sandbox plan changed between probe and launch")
                      checked-after))
-          socket-dir (Files/createTempDirectory control-dir "jvm-session-"
+          socket-dir (Files/createTempDirectory control-dir "s-"
                                                (make-array java.nio.file.attribute.FileAttribute 0))
           listener (atom nil)
           process (atom nil)
@@ -343,9 +380,10 @@
                         :startup-timeout-ms startup-ms :shutdown-timeout-ms shutdown-ms}]
       (try
         (let [socket (.resolve socket-dir "control.sock")
+              socket-address (socket-address! socket cwd)
               server (ServerSocketChannel/open StandardProtocolFamily/UNIX)]
           (reset! listener server)
-          (.bind server (UnixDomainSocketAddress/of socket))
+          (.bind server (UnixDomainSocketAddress/of socket-address))
           (let [builder (ProcessBuilder. ^java.util.List
                                          (if admitted? (:argv launch) command))
                 env (.environment builder)]
@@ -353,7 +391,7 @@
             (when admitted? (.putAll env (:env launch)))
             (.redirectOutput builder (.toFile stdout))
             (.redirectError builder (.toFile stderr))
-            (.put env "SHARD_CONTROL_SOCKET" (str socket))
+            (.put env "SHARD_CONTROL_SOCKET" socket-address)
             (.put env "SHARD_SESSION_ID" (:session-id identity))
             (.put env "SHARD_WORKER_ID" worker-id)
             (.put env "SHARD_RUNTIME_FINGERPRINT" runtime-fingerprint)
