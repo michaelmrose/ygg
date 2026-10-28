@@ -1660,6 +1660,39 @@
                  (not (Files/isSymbolicLink (.toPath (io/file f)))))
             "Missing or unsafe directory" {:path (str f)}))
 
+(defn- publish-latest-run! [run]
+  ;; Publication is a read-only navigation aid; no symlink is followed when
+  ;; validating or replacing it.  Keep the target relative to .ygg/runs/ so
+  ;; a relocated checkout still points to the same run.
+  (let [^Path run-path (.toAbsolutePath (.normalize (.toPath (io/file run))))
+        ^Path runs (.getParent run-path)
+        ^Path name (.getFileName run-path)
+        ^Path latest (.resolve runs "latest")
+        ^Path temporary (.resolve runs (str ".latest-" (UUID/randomUUID) ".tmp"))
+        no-follow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS])]
+    (real-directory! (.toFile runs))
+    (require! (and (re-matches #"run-[A-Za-z0-9._-]+" (str name))
+                   (Files/isRegularFile (.resolve run-path "jobs.edn") no-follow)
+                   (Files/isRegularFile (.resolve run-path "schedule.edn") no-follow)
+                   (Files/isRegularFile (.resolve run-path "source.edn") no-follow)
+                   (not (Files/isSymbolicLink run-path)))
+              "Latest-run target is not a fully published run"
+              {:run (str run)})
+    (require! (or (not (Files/exists latest no-follow))
+                  (Files/isSymbolicLink latest))
+              "Refusing to replace a non-symlink latest entry"
+              {:path (str latest)})
+    (try
+      (Files/createSymbolicLink temporary name no-attributes)
+      ;; A same-directory atomic rename means readers see either the old
+      ;; symlink or the new one, never a partly written target.
+      (Files/move temporary latest
+                  (into-array java.nio.file.CopyOption
+                              [StandardCopyOption/ATOMIC_MOVE
+                               StandardCopyOption/REPLACE_EXISTING]))
+      (finally
+        (Files/deleteIfExists temporary)))))
+
 (defn- source-revision! [root]
   (let [git-root (str/trim (command! root ["git" "rev-parse" "--show-toplevel"]))
         head (str/trim (command! root ["git" "rev-parse" "HEAD"]))
@@ -2157,6 +2190,7 @@
                                             :ygg-snapshot (:snapshot status)
                                             :inventory-sha256 (:inventory-sha256 manifest)
                                             :clones clones}))
+                      (publish-latest-run! run)
                       (println "SHARD RUN" (.getPath run)
                                "JOBS" (count (:jobs manifest)))
                       (flush)
