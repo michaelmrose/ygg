@@ -1,6 +1,8 @@
 #!/usr/bin/env bb
 ;; Ygg: conservative ZFS workspace clones for a repository at a dataset root.
-;; Usage: ygg [-n N] create | status [--edn] | clean | tail [--workers|--stderr|--all] [--run PATH] [--once]
+;; Usage: ygg [-n N] create | status [--edn] | clean
+;;        ygg tail [--workers|--stderr|--all] [--run PATH] [--once]
+;;        ygg report [--edn] [--run PATH]
 ;; Clone mountpoints: REPO/.ygg/workers/1 ... N; run results: REPO/.ygg/runs/.
 ;; Shard holds an exclusive FileChannel lock on .ygg/.workers.lock while using
 ;; the clones. Ygg clean refuses to proceed while that lock is held.
@@ -469,6 +471,20 @@
           (Thread/sleep 350)
           (recur next-known false))))))
 
+;; Shard remains the sole source of report validation and rendering. This
+;; command selects a safely published run without ZFS privileges/locks, then
+;; transparently forwards stdout, stderr and the reporter's exit status.
+;; It neither reads nor changes result receipts itself.
+(defn- report! [root {:keys [run edn?]}]
+  (let [selected (tail-run! root run)
+        command (cond-> ["shard" "report" (str selected)]
+                  edn? (conj "--edn"))
+        process (.start (doto (ProcessBuilder. ^java.util.List command)
+                          (.inheritIO)))
+        exit (.waitFor process)]
+    (when-not (zero? exit)
+      (System/exit exit))))
+
 (defn- parse-args [argv]
   (loop [xs (seq argv) parsed {}]
     (if (empty? xs)
@@ -495,7 +511,7 @@
           (= "--edn" x)
           (do (when (:edn? parsed) (fail! "Duplicate --edn"))
               (recur (next xs) (assoc parsed :edn? true)))
-          (#{"create" "clean" "status" "tail"} x)
+          (#{"create" "clean" "status" "tail" "report"} x)
           (do (when (:action parsed) (fail! "Multiple actions"))
               (recur (next xs) (assoc parsed :action (keyword x))))
           (str/starts-with? x "-") (fail! (str "Unrecognized option: " x))
@@ -541,18 +557,23 @@
         action (or (:action cli) (:action config))
         n (or (:n cli) (:n config) 1)]
     (when-not (.isDirectory (io/file root)) (fail! "Not a directory"))
-    (when-not (#{:create :clean :status :tail} action)
-      (fail! "Specify create, clean, status, tail or :action in ygg.edn"))
+    (when-not (#{:create :clean :status :tail :report} action)
+      (fail! "Specify create, clean, status, tail, report or :action in ygg.edn"))
     (when-not (and (integer? n) (<= 1 n 256))
       (fail! "Clone count must be 1..256"))
-    (when (and (:edn? cli) (not= action :status))
-      (fail! "--edn is supported only for status"))
-    (when (and (not= action :tail) (some? (some cli [:mode :run :once?])))
-      (fail! "Tail options are supported only for tail"))
-    (when (and (= action :tail) (:n cli))
-      (fail! "-n is not supported for tail"))
-    (if (= action :tail)
-      (tail! root cli)
+    (when (and (:edn? cli) (not (#{:status :report} action)))
+      (fail! "--edn is supported only for status and report"))
+    (when (and (not= action :tail) (:mode cli))
+      (fail! "Output modes are supported only for tail"))
+    (when (and (not= action :tail) (:once? cli))
+      (fail! "--once is supported only for tail"))
+    (when (and (not (#{:tail :report} action)) (:run cli))
+      (fail! "--run is supported only for tail and report"))
+    (when (and (#{:tail :report} action) (:n cli))
+      (fail! "-n is not supported for tail or report"))
+    (case action
+      :tail (tail! root cli)
+      :report (report! root cli)
       (let [source (source-dataset root)]
         (with-lock root #(case action
                            :create (with-worker-idle root (fn [] (create! root source n)))
