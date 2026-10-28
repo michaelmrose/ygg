@@ -2071,6 +2071,281 @@ sys.exit(2)")
         (is (empty? (or (.listFiles (file (:run fx) "results")) [])))
         (is (not (exists? (file (:workspace fx) "scratch-job-ran"))))))))
 
+;; v1117: Persistent sessions are deliberately *test-injected*, not admitted
+;; by the production CLI.  This section exercises the real v1116 Shard claim
+;; loop, on-disk inventory/claims/results and two actual JVM processes.  Only
+;; the sandbox preflight is replaced by a test-only no-op: the v1114 session
+;; launcher cannot prove Bubblewrap/process-group admission.  Those remain
+;; separate production acceptance gates; never describe this as sandbox proof.
+(defn- persistent-shard-namespace! []
+  (let [source (slurp (shard!))
+        final-call "(apply -main *command-line-args*)"
+        trimmed (str/trimr source)
+        n (create-ns (gensym "shard_test_embedded_"))]
+    (when-not (str/ends-with? trimmed final-call)
+      (throw (ex-info "Shard entry point changed; do not run production -main in fixture" {})))
+    (binding [*ns* n]
+      (load-string (subs trimmed 0 (- (count trimmed) (count final-call)))))
+    (let [worker (ns-resolve n 'worker!)
+          preflight (ns-resolve n 'sandbox-preflight!)
+          canonical (ns-resolve n 'canonical-edn)
+          digest (ns-resolve n 'digest)]
+      (when-not (every? some? [worker preflight canonical digest])
+        (throw (ex-info "Shard private fixture seam has changed" {})))
+      {:worker worker :preflight preflight :canonical canonical :digest digest})))
+
+(defn- persistent-runtime [command]
+  {:identity "shard-jvm-test-v1117"
+   :capabilities #{}
+   :execution :persistent-jvm
+   :session-command command})
+
+(defn- persistent-job
+  ([id namespace] (persistent-job id namespace [] 15000))
+  ([id namespace dependencies timeout-ms]
+   {:id id :gate :jvm :runtime :jvm
+    :unit {:type :clojure-namespace :name namespace}
+    ;; Invalid fallback command deliberately proves no old per-job subprocess
+    ;; path can masquerade as persistent execution.
+    :command ["/must-not-run-fallback-subprocess"]
+    :depends-on dependencies :timeout-ms timeout-ms :requires #{}}))
+
+(defn- enumerate-persistent! [fx runtime jobs]
+  (let [cfg (file (:base fx) "persistent.edn")]
+    (spit cfg (pr-str {:version 1 :project-root (.getCanonicalPath (:project fx))
+                       :runtimes {:jvm runtime} :jobs (vec jobs)}))
+    (let [r (invoke fx "enumerate" (str cfg) (str (:run fx)))]
+      (is (= 0 (:exit r)) (:out r))
+      r)))
+
+(defn- persistent-fixture-ns! [dir namespace body]
+  (let [name-path (str (-> namespace
+                           (str/replace "." "/")
+                           (str/replace "-" "_")) ".clj")
+        target (file dir name-path)]
+    (.mkdirs (.getParentFile target))
+    (spit target (str "(ns " namespace " (:require [clojure.test :refer [deftest is]]))\n" body "\n"))))
+
+(defn- persistent-java-command [classpath]
+  [(str (System/getProperty "java.home") java.io.File/separator "bin"
+        java.io.File/separator "java")
+   "-Xmx256m" "-cp" classpath "clojure.main" "-m" "shard.worker.jvm"])
+
+(defn- persistent-session! [fx command fingerprint worker-id]
+  ((requiring-resolve 'shard.runtime.jvm-session/start!)
+   {:test-only? true
+    :command command :cwd (.getCanonicalPath (:project fx))
+    :control-dir (.getCanonicalPath (:base fx))
+    :stdout-file (.getCanonicalPath (file (:base fx) (str worker-id ".out")))
+    :stderr-file (.getCanonicalPath (file (:base fx) (str worker-id ".err")))
+    :worker-id worker-id :runtime-fingerprint fingerprint
+    :startup-timeout-ms 30000 :shutdown-timeout-ms 10000}))
+
+(defn- persistent-fingerprint [embedded runtime]
+  ((:digest embedded)
+   ((:canonical embedded)
+    {:runtime :jvm :identity (:identity runtime)
+     :session-command (:session-command runtime)})))
+
+(defn- test-worker-thread! [embedded fx workspace session]
+  (.mkdirs (io/file workspace))
+  (let [answer (promise)
+        t (Thread.
+           (fn []
+             (deliver answer
+                      (try
+                        ((:worker embedded) (str (:run fx)) (str workspace)
+                         "jvm" 15000 nil session)
+                        {:status :finished}
+                        (catch Throwable t
+                          {:status :threw :message (.getMessage t)
+                           :data (ex-data t)}))))
+           "shard-persistent-claim-fixture")]
+    (.setDaemon t true)
+    (.start t)
+    {:thread t :answer answer}))
+
+(defn- await-fixture-files! [files timeout-ms]
+  (let [deadline (+ (System/nanoTime) (* timeout-ms 1000000))]
+    (loop []
+      (cond
+        (every? exists? files) true
+        (> (System/nanoTime) deadline) false
+        :else (do (Thread/sleep 20) (recur))))))
+
+(defn- complete-worker-thread! [{:keys [^Thread thread answer]}]
+  (let [result (deref answer 25000 ::timeout)]
+    (.join thread 1000)
+    (is (not= ::timeout result) "Injected Shard worker must terminate")
+    (is (not (.isAlive thread)) "Worker thread must not leak")
+    result))
+
+(deftest persistent-cli-refuses-production-session-before-claim
+  (with-fixture
+    (fn [fx]
+      (let [command ["java" "-m" "shard.worker.jvm"]
+            runtime (persistent-runtime command)]
+        (enumerate-persistent! fx runtime [(persistent-job "a" "shard.test-pass-test")])
+        (let [r (worker fx)]
+          (is (not= 0 (:exit r)))
+          (is (str/includes? (:out r) "production admission is not implemented")
+              (:out r))
+          (is (empty? (or (.listFiles (file (:run fx) "claims")) [])))
+          (is (empty? (or (.listFiles (file (:run fx) "results")) []))))))))
+
+(deftest persistent-inventory-rejects-unsafe-units
+  (with-fixture
+    (fn [fx]
+      (let [runtime (persistent-runtime ["java" "-m" "shard.worker.jvm"])]
+        (doseq [unit [{:type :namespace :name "shard.good-test"}
+                      {:type :clojure-namespace :name "no-slash/allowed"}
+                      {:type :clojure-namespace :name "shard..bad-test"}]]
+          (let [jobs [(assoc (persistent-job "a" "shard.good-test") :unit unit)]
+                cfg (file (:base fx) "invalid-persistent.edn")]
+            (spit cfg (pr-str {:version 1
+                               :project-root (.getCanonicalPath (:project fx))
+                               :runtimes {:jvm runtime} :jobs jobs}))
+            (let [r (invoke fx "enumerate" (str cfg) (str (:run fx)))]
+              (is (not= 0 (:exit r)) (:out r))
+              (is (not (exists? (file (:run fx) "jobs.edn")))))))))))
+
+(deftest persistent-jvm-claim-loop-concurrent-reuse-and-dependencies
+  (let [cp (not-empty (System/getenv "SHARD_TEST_JVM_CLASSPATH"))
+        require-native? (= "1" (System/getenv "SHARD_TEST_REQUIRE_JVM"))]
+    (cond
+      cp
+      (with-fixture
+        (fn [fx]
+          (let [embedded (persistent-shard-namespace!)
+                src (file (:base fx) "native-src")
+                real-cp (str cp java.io.File/pathSeparator
+                             (.getCanonicalPath (file (System/getProperty "user.dir") "src"))
+                             java.io.File/pathSeparator (.getCanonicalPath src))
+                command (persistent-java-command real-cp)
+                runtime (persistent-runtime command)
+                fingerprint (persistent-fingerprint embedded runtime)
+                first-release (file (:base fx) "first.release")
+                second-release (file (:base fx) "second.release")
+                begin (fn [marker release]
+                        (str "(deftest synchronized-job "
+                             "(spit " (pr-str (str marker)) " \"started\") "
+                             "(let [limit (+ (System/nanoTime) 12000000000)] "
+                             "(loop [] (when-not (.exists (java.io.File. "
+                             (pr-str (str release)) ")) "
+                             "(if (< (System/nanoTime) limit) "
+                             "(do (Thread/sleep 20) (recur)) "
+                             "(throw (ex-info \"test barrier timed out\" {})))))) "
+                             "(is true))"))
+                first-names ["shard.claim-a-test" "shard.claim-b-test"]
+                second-names ["shard.claim-c-test" "shard.claim-d-test"]
+                first-markers (mapv #(file (:base fx) (str % ".started")) first-names)
+                second-markers (mapv #(file (:base fx) (str % ".started")) second-names)
+                jobs [(persistent-job "a" (first first-names))
+                      (persistent-job "b" (second first-names))
+                      (persistent-job "c" (first second-names) ["a" "b"] 15000)
+                      (persistent-job "d" (second second-names) ["a" "b"] 15000)
+                      (persistent-job "e" "shard.claim-pass-test" ["c" "d"] 15000)
+                      (persistent-job "f" "shard.claim-fail-test" ["c" "d"] 15000)
+                      (persistent-job "g" "shard.claim-pass-test" ["f"] 15000)
+                      (persistent-job "h" "shard.claim-pass-test" ["e"] 15000)]
+                sessions (atom [])
+                workers (atom [])]
+            (.mkdirs src)
+            (doseq [[name marker] (map vector first-names first-markers)]
+              (persistent-fixture-ns! src name (begin marker first-release)))
+            (doseq [[name marker] (map vector second-names second-markers)]
+              (persistent-fixture-ns! src name (begin marker second-release)))
+            (persistent-fixture-ns! src "shard.claim-pass-test"
+                                    "(deftest passes (is (= 2 (+ 1 1))))")
+            (persistent-fixture-ns! src "shard.claim-fail-test"
+                                    "(deftest fails (is (= 1 2)))")
+            (enumerate-persistent! fx runtime jobs)
+            (try
+              (reset! sessions [(persistent-session! fx command fingerprint "claim.1")
+                                (persistent-session! fx command fingerprint "claim.2")])
+              (is (not= (:pid (first @sessions)) (:pid (second @sessions))))
+              ;; This is the ONLY seam replaced: production Shard still refuses
+              ;; the sessionless CLI, while this test validates the actual
+              ;; Shard claim loop, result publication and dependency resolution.
+              (with-redefs-fn {(:preflight embedded) (fn [_] true)}
+                (fn []
+                  (reset! workers
+                          (mapv #(test-worker-thread! embedded fx
+                                                      (file (:base fx) (str "clone-" %2)) %1)
+                                @sessions [1 2]))
+                  (is (await-fixture-files! first-markers 12000)
+                      "Two workers must execute distinct stage-one jobs concurrently")
+                  (spit first-release "release")
+                  (is (await-fixture-files! second-markers 12000)
+                      "Two workers must continue into separate second jobs")
+                  (spit second-release "release")
+                  (is (every? #(= :finished (:status %))
+                              (mapv complete-worker-thread! @workers)))))
+              (let [outcomes (into {} (map (juxt :id identity) (vals (results fx))))
+                    report-result (report fx)]
+                (is (= #{"a" "b" "c" "d" "e" "f" "g" "h"}
+                       (set (keys outcomes))))
+                (is (= {:a :passed :b :passed :c :passed :d :passed
+                        :e :passed :f :failed :g :blocked :h :passed}
+                       (into {} (map (fn [[id r]] [(keyword id) (:status r)]) outcomes))))
+                (is (= :fail (get-in report-result [:edn :overall]))
+                    (str report-result))
+                (is (= 8 (count (or (.listFiles (file (:run fx) "claims")) []))))
+                (is (= 8 (count outcomes)))
+                (is (every? #(>= (count @(:completed-job-ids %)) 2) @sessions)
+                    "Each JVM must execute at least two separately CLAIMED jobs")
+                (is (= 7 (reduce + (map #(count @(:completed-job-ids %)) @sessions)))
+                    "Seven executable jobs, one blocked dependency")
+                (is (not (exists? (file (:workspace fx) "must-not-run-fallback-subprocess")))))
+              (finally
+                (spit first-release "force release")
+                (spit second-release "force release")
+                (doseq [w @workers] (complete-worker-thread! w))
+                (doseq [s @sessions]
+                  ((requiring-resolve 'shard.runtime.jvm-session/abort!) s)))))))
+      require-native? (is false "SHARD_TEST_JVM_CLASSPATH missing for mandatory live claim test")
+      :else (println "SKIP persistent-jvm-claim-loop-concurrent-reuse-and-dependencies: set SHARD_TEST_JVM_CLASSPATH"))))
+
+(deftest persistent-jvm-lost-session-keeps-claim-incomplete
+  (let [cp (not-empty (System/getenv "SHARD_TEST_JVM_CLASSPATH"))
+        require-native? (= "1" (System/getenv "SHARD_TEST_REQUIRE_JVM"))]
+    (cond
+      cp
+      (with-fixture
+        (fn [fx]
+          (let [embedded (persistent-shard-namespace!)
+                src (file (:base fx) "native-src")
+                real-cp (str cp java.io.File/pathSeparator
+                             (.getCanonicalPath (file (System/getProperty "user.dir") "src"))
+                             java.io.File/pathSeparator (.getCanonicalPath src))
+                command (persistent-java-command real-cp)
+                runtime (persistent-runtime command)
+                fingerprint (persistent-fingerprint embedded runtime)
+                s (atom nil)]
+            (.mkdirs src)
+            (persistent-fixture-ns! src "shard.claim-timeout-test"
+                                    "(deftest waits-forever (Thread/sleep 5000) (is true))")
+            (enumerate-persistent! fx runtime
+                                   [(persistent-job "a-timeout" "shard.claim-timeout-test" [] 200)])
+            (try
+              (reset! s (persistent-session! fx command fingerprint "timed.1"))
+              (with-redefs-fn {(:preflight embedded) (fn [_] true)}
+                (fn []
+                  (let [w (test-worker-thread! embedded fx (file (:base fx) "clone-1") @s)
+                        outcome (complete-worker-thread! w)]
+                    (is (= :threw (:status outcome)) (pr-str outcome)))))
+              (is (= :poisoned @(:phase @s)))
+              (is (not (.isAlive ^Process (:process @s))))
+              (is (= 1 (count (or (.listFiles (file (:run fx) "claims")) []))))
+              (is (empty? (results fx)) "Timed-out claim must NOT have a forged success")
+              (let [r (report fx)]
+                (is (not= 0 (:exit r)))
+                (is (= :incomplete (get-in r [:edn :overall])) (pr-str r)))
+              (finally
+                (when @s ((requiring-resolve 'shard.runtime.jvm-session/abort!) @s)))))))
+      require-native? (is false "SHARD_TEST_JVM_CLASSPATH missing for mandatory JVM timeout test")
+      :else (println "SKIP persistent-jvm-lost-session-keeps-claim-incomplete: set SHARD_TEST_JVM_CLASSPATH"))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
