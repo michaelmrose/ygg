@@ -3,6 +3,7 @@
 ;; Usage: ygg [-n N] create | status [--edn] | clean
 ;;        ygg tail [--workers|--stderr|--all] [--run PATH] [--once]
 ;;        ygg report [--edn] [--run PATH]
+;;        ygg jobs [--all] [--sort duration|error] [--run PATH]
 ;; Clone mountpoints: REPO/.ygg/workers/1 ... N; run results: REPO/.ygg/runs/.
 ;; Shard holds an exclusive FileChannel lock on .ygg/.workers.lock while using
 ;; the clones. Ygg clean refuses to proceed while that lock is held.
@@ -485,6 +486,100 @@
     (when-not (zero? exit)
       (System/exit exit))))
 
+;; Job ranking is an observational view of Shard's validated receipt data.
+;; Incomplete and failed reports exit 1 by design, but still contain valid EDN.
+;; Never derive success from the exit code alone or read unvalidated receipts.
+(defn- jobs-report! [run]
+  (let [{:keys [exit out err]} (shell/sh "shard" "report" (str run) "--edn")
+        report (try (edn/read-string {:readers {} :default (fn [_ _] ::untrusted)}
+                                     out)
+                    (catch Exception _ nil))]
+    (when-not (and (#{0 1} exit)
+                   (map? report)
+                   (= :shard/report (:format report))
+                   (= 1 (:version report))
+                   (#{:pass :fail :incomplete} (:overall report))
+                   (= (if (= :pass (:overall report)) 0 1) exit)
+                   (vector? (:jobs report))
+                   (integer? (:total report))
+                   (= (:total report) (count (:jobs report))))
+      (fail! "Cannot obtain a validated Shard report"
+             {:cause (str/trim (or err ""))}))
+    report))
+
+(defn- jobs-estimates! [run report]
+  (let [schedule (.resolve run "schedule.edn")]
+    (if (Files/exists schedule no-follow)
+      (do
+        (when-not (Files/isRegularFile schedule no-follow)
+          (fail! "Unsafe job schedule file" {:path (str schedule)}))
+        (let [value (read-edn (.toFile schedule))
+              times (:estimated-ms value)
+              ids (set (map :id (:jobs report)))]
+          (when-not (and (= :shard/schedule (:format value))
+                         (= 1 (:version value))
+                         (= (:inventory-sha256 report) (:inventory-sha256 value))
+                         (map? times)
+                         (= ids (set (keys times)))
+                         (every? (fn [[_ n]] (and (integer? n) (<= 0 n))) times))
+            (fail! "Run schedule does not match validated job inventory"))
+          times))
+      {})))
+
+(defn- jobs-duration [ms]
+  (cond
+    (nil? ms) "-"
+    (>= ms 60000) (format "%dm%02ds" (quot ms 60000)
+                           (quot (mod ms 60000) 1000))
+    (>= ms 1000) (format "%d.%01ds" (quot ms 1000)
+                          (quot (mod ms 1000) 100))
+    :else (str ms "ms")))
+
+(defn- jobs! [root {:keys [run all? sort]}]
+  (let [selected (tail-run! root run)
+        report (jobs-report! selected)
+        estimates (jobs-estimates! selected report)
+        entries (mapv (fn [entry]
+                        (let [estimate (get estimates (:id entry))
+                              actual (:duration-ms entry)]
+                          (assoc entry :estimate estimate
+                                 :error (when (and estimate (integer? actual))
+                                          (- actual estimate)))))
+                      (:jobs report))
+        actual (filterv #(and (integer? (:duration-ms %))
+                              (string? (:worker-id %))) entries)
+        sorted (sort-by (if (= sort :error)
+                          (fn [{:keys [id error duration-ms]}]
+                            [(if (nil? error) 1 0)
+                             (- (Math/abs (long (or error 0))))
+                             (- (or duration-ms 0)) id])
+                          (fn [{:keys [id duration-ms]}]
+                            [(if (nil? duration-ms) 1 0)
+                             (- (or duration-ms 0)) id]))
+                        (if all? entries actual))
+        displayed (if all? sorted (take 20 sorted))]
+    (println "YGG JOBS" (name (:overall report))
+             "run" (str (.getFileName selected)))
+    (println "Measured:" (count actual) "/" (:total report)
+             "| order:" (if (= sort :error) "estimate error" "actual duration")
+             "| showing:" (count displayed))
+    (println "ACTUAL      ESTIMATE    DELTA       WORKER    STATUS         JOB")
+    (doseq [{:keys [id duration-ms estimate error worker-id status]} displayed]
+      (println (format "%-11s %-11s %-11s %-9s %-14s %s"
+                       (jobs-duration duration-ms)
+                       (jobs-duration estimate)
+                       (if (nil? error) "-"
+                           (str (if (neg? error) "-" "+")
+                                (jobs-duration (Math/abs (long error)))))
+                       (if worker-id
+                         (subs worker-id 0 (min 8 (count worker-id))) "-")
+                       (name status) id)))
+    (when (< (count actual) (:total report))
+      (println "INCOMPLETE: jobs without validated receipts have no measured duration"))
+    (when (empty? estimates)
+      (println "No schedule estimates available for this run"))
+    (flush)))
+
 (defn- parse-args [argv]
   (loop [xs (seq argv) parsed {}]
     (if (empty? xs)
@@ -500,6 +595,15 @@
           (= "--run" x)
           (do (when (or (not (second xs)) (:run parsed)) (fail! "Missing or duplicate --run"))
               (recur (nnext xs) (assoc parsed :run (second xs))))
+          (= "--all" x)
+          (do (when (:all? parsed) (fail! "Duplicate --all"))
+              (recur (next xs) (assoc parsed :all? true)))
+          (= "--sort" x)
+          (do (when (or (:sort parsed) (nil? (second xs)))
+                (fail! "Missing or duplicate --sort"))
+              (let [sort-key ({"duration" :duration "error" :error} (second xs))]
+                (when-not sort-key (fail! "--sort must be duration or error"))
+                (recur (nnext xs) (assoc parsed :sort sort-key))))
           (= "--once" x)
           (do (when (:once? parsed) (fail! "Duplicate --once"))
               (recur (next xs) (assoc parsed :once? true)))
@@ -511,7 +615,7 @@
           (= "--edn" x)
           (do (when (:edn? parsed) (fail! "Duplicate --edn"))
               (recur (next xs) (assoc parsed :edn? true)))
-          (#{"create" "clean" "status" "tail" "report"} x)
+          (#{"create" "clean" "status" "tail" "report" "jobs"} x)
           (do (when (:action parsed) (fail! "Multiple actions"))
               (recur (next xs) (assoc parsed :action (keyword x))))
           (str/starts-with? x "-") (fail! (str "Unrecognized option: " x))
@@ -557,8 +661,8 @@
         action (or (:action cli) (:action config))
         n (or (:n cli) (:n config) 1)]
     (when-not (.isDirectory (io/file root)) (fail! "Not a directory"))
-    (when-not (#{:create :clean :status :tail :report} action)
-      (fail! "Specify create, clean, status, tail, report or :action in ygg.edn"))
+    (when-not (#{:create :clean :status :tail :report :jobs} action)
+      (fail! "Specify create, clean, status, tail, report, jobs or :action in ygg.edn"))
     (when-not (and (integer? n) (<= 1 n 256))
       (fail! "Clone count must be 1..256"))
     (when (and (:edn? cli) (not (#{:status :report} action)))
@@ -567,13 +671,16 @@
       (fail! "Output modes are supported only for tail"))
     (when (and (not= action :tail) (:once? cli))
       (fail! "--once is supported only for tail"))
-    (when (and (not (#{:tail :report} action)) (:run cli))
-      (fail! "--run is supported only for tail and report"))
-    (when (and (#{:tail :report} action) (:n cli))
-      (fail! "-n is not supported for tail or report"))
+    (when (and (not= action :jobs) (or (:all? cli) (:sort cli)))
+      (fail! "--all and --sort are supported only for jobs"))
+    (when (and (not (#{:tail :report :jobs} action)) (:run cli))
+      (fail! "--run is supported only for tail, report and jobs"))
+    (when (and (#{:tail :report :jobs} action) (:n cli))
+      (fail! "-n is not supported for tail, report or jobs"))
     (case action
       :tail (tail! root cli)
       :report (report! root cli)
+      :jobs (jobs! root cli)
       (let [source (source-dataset root)]
         (with-lock root #(case action
                            :create (with-worker-idle root (fn [] (create! root source n)))
