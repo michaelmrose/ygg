@@ -872,8 +872,13 @@
      :worker-id worker-id}))
 
 (defn- admitted-clojure-command! [command staged-src project-deps]
-  ;; Only the declared Clojure CLI -M invocation is supported; do not guess
-  ;; how to inject into a different launcher or silently revert to a child.
+  ;; -M:aliases obtains more than dependencies and JVM settings: a selected
+  ;; alias can also declare :main-opts. An explicit trailing -m does NOT
+  ;; override those options. Gesso's :test alias launches cognitect.test-runner,
+  ;; so blindly appending `-m shard.worker.jvm` would execute the WRONG main.
+  ;; Stage a renamed copy of each selected main-bearing alias, removing ONLY
+  ;; :main-opts while preserving its test classpath, dependencies and JVM opts.
+  ;; No generic CLJ eval or sub-JVM command fallback is allowed.
   (require! (and (= 4 (count command))
                  (re-matches #"(?:.*/)?clojure" (first command))
                  (re-matches #"-M(?::[A-Za-z0-9._/-]+)+" (second command))
@@ -883,20 +888,45 @@
             {:command command})
   (require! (Files/isRegularFile project-deps source-no-follow)
             "Persistent JVM requires a real, non-symlink project deps.edn")
-  (let [reserved (str persistent-worker-alias)
-        selected (second command)
-        deps-map (read-edn! (slurp (.toFile project-deps)) "project deps.edn")]
+  (let [selected (second command)
+        names (str/split (subs selected 3) #":")
+        deps-map (read-edn! (slurp (.toFile project-deps)) "project deps.edn")
+        project-aliases (:aliases deps-map)
+        runtime-alias persistent-worker-alias
+        clone-alias (fn [index] (keyword "shard.runtime" (str "entry-" index)))
+        reserved (conj (set (map clone-alias (range (count names)))) runtime-alias)]
     (require! (map? deps-map) "Project deps.edn must be a map")
-    (require! (or (nil? (:aliases deps-map)) (map? (:aliases deps-map)))
+    (require! (or (nil? project-aliases) (map? project-aliases))
               "Project deps.edn :aliases must be a map")
-    (require! (not (contains? (:aliases deps-map) persistent-worker-alias))
-              "Project deps.edn defines reserved Shard worker alias")
-    (require! (not (some #{(subs reserved 1)} (str/split selected #":")))
-              "Persistent JVM runtime selected reserved worker alias")
-    (let [overlay (pr-str {:aliases {persistent-worker-alias
-                                    {:extra-paths [staged-src]}}})]
-      [(first command) "-Sdeps" overlay (str selected ":" (subs reserved 1))
-       "-m" "shard.worker.jvm"])))
+    (require! (empty? (set/intersection reserved (set (keys project-aliases))))
+              "Project deps.edn defines a reserved Shard runtime alias")
+    (require! (every? #(not (str/starts-with? % "shard.runtime/")) names)
+              "Persistent JVM runtime selected a reserved Shard alias")
+    (let [selected-aliases (mapv keyword names)
+          _ (doseq [alias selected-aliases]
+              (require! (map? (get project-aliases alias))
+                        "Persistent JVM selected an undeclared project alias"
+                        {:alias alias}))
+          changed (mapv (fn [index alias]
+                          (let [definition (get project-aliases alias)]
+                            (if (contains? definition :main-opts)
+                              (do
+                                (require! (sequential? (:main-opts definition))
+                                          "Invalid project alias :main-opts"
+                                          {:alias alias})
+                                {:name (clone-alias index)
+                                 :entry (dissoc definition :main-opts)})
+                              {:name alias})))
+                        (range) selected-aliases)
+          overlay (pr-str {:aliases
+                           (assoc (into (sorted-map)
+                                        (keep (fn [{:keys [name entry]}]
+                                                (when entry [name entry])) changed))
+                                  runtime-alias {:extra-paths [staged-src]})})
+          output-aliases (concat (map (comp #(subs (str %) 1) :name) changed)
+                                 [(subs (str runtime-alias) 1)])]
+      [(first command) "-Sdeps" overlay
+       (str "-M:" (str/join ":" output-aliases)) "-m" "shard.worker.jvm"])))
 
 (defn- start-admitted-jvm-session! [run workspace manifest runtime worker-env worker-id]
   ;; The worker process stays OUTSIDE the namespace. Only the long-lived JVM
