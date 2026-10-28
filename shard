@@ -1327,7 +1327,9 @@
                             (cond-> {:id id :gate gate :runtime runtime :status status}
                               result (assoc :duration-ms (:duration-ms result)
                                             :log (:log result)
-                                            :worker-id (:worker-id result))
+                                            :worker-id (:worker-id result)
+                                            :started-at (:started-at result)
+                                            :completed-at (:completed-at result))
                               (and result (= :blocked status))
                               (assoc :blocked-by (:blocked-by result))))) jobs)
           counts (merge (zipmap report-status-order (repeat 0))
@@ -1348,11 +1350,94 @@
        :jvm-timing (when include-timing?
                      (jvm-timing-summary! run jobs results))}))))
 
+;; The human summary is derived entirely from already validated immutable
+;; receipts. It never treats the scheduling preference as actual ownership.
+;; The observed job window excludes coordinator startup, clone creation,
+;; preparation and final cleanup, so do not call it total run wall time.
+(defn- milliseconds-between [^Instant start ^Instant finish]
+  (max 0 (.toMillis (java.time.Duration/between start finish))))
+
+(defn- human-duration [ms]
+  (let [ms (long ms)]
+    (cond
+      (>= ms 60000)
+      (format "%dm%02d.%01ds" (quot ms 60000)
+              (quot (mod ms 60000) 1000)
+              (quot (mod ms 1000) 100))
+      (>= ms 1000)
+      (format "%d.%01ds" (quot ms 1000) (quot (mod ms 1000) 100))
+      :else (str ms "ms"))))
+
+(defn- observed-job-summary [report]
+  (let [finished (->> (:jobs report)
+                      (filter #(and (:worker-id %) (:started-at %)
+                                    (:completed-at %) (integer? (:duration-ms %))))
+                      (mapv #(assoc % :start (Instant/parse (:started-at %))
+                                       :finish (Instant/parse (:completed-at %)))))
+        first-start (when (seq finished)
+                      (reduce (fn [a b] (if (.isBefore ^Instant a b) a b))
+                              (map :start finished)))
+        last-finish (when (seq finished)
+                      (reduce (fn [a b] (if (.isAfter ^Instant a b) a b))
+                              (map :finish finished)))
+        workers (->> finished
+                     (group-by :worker-id)
+                     (map (fn [[worker-id tasks]]
+                            (let [start (reduce (fn [a b]
+                                                  (if (.isBefore ^Instant a b) a b))
+                                                (map :start tasks))
+                                  finish (reduce (fn [a b]
+                                                   (if (.isAfter ^Instant a b) a b))
+                                                 (map :finish tasks))
+                                  busy-ms (reduce + 0 (map :duration-ms tasks))
+                                  span-ms (milliseconds-between start finish)]
+                              {:worker-id worker-id
+                               :jobs (count tasks)
+                               :busy-ms busy-ms
+                               :span-ms span-ms
+                               :idle-within-ms (max 0 (- span-ms busy-ms))
+                               :idle-tail-ms (milliseconds-between finish last-finish)})))
+                     (sort-by :worker-id)
+                     vec)]
+    {:jobs (count finished)
+     :job-window-ms (when (seq finished)
+                      (milliseconds-between first-start last-finish))
+     :workers workers
+     :slowest (->> finished
+                   (sort-by (fn [{:keys [duration-ms id]}]
+                              [(- duration-ms) id]))
+                   (take 5) vec)}))
+
+(defn- print-observed-summary! [report]
+  (let [{:keys [jobs job-window-ms workers slowest]}
+        (observed-job-summary report)]
+    (when (pos? jobs)
+      (println "Observed execution (from" jobs "completed receipts):")
+      (println "  Job window:" (human-duration job-window-ms)
+               "(first job start to last completion; excludes setup/cleanup)")
+      (println "  Worker activity: busy=sum of job durations; gaps=idle within")
+      (println "  each worker's first-to-last job span; tail=until last job completes")
+      (doseq [{:keys [worker-id jobs busy-ms idle-within-ms idle-tail-ms]}
+              workers]
+        (println (format "  Worker %-8s jobs %3d  busy %9s  gaps %9s  tail %9s"
+                         (subs worker-id 0 (min 8 (count worker-id)))
+                         jobs (human-duration busy-ms)
+                         (human-duration idle-within-ms)
+                         (human-duration idle-tail-ms))))
+      (println "  Slowest completed jobs:")
+      (doseq [{:keys [id duration-ms worker-id status]} slowest]
+        (println "   " (human-duration duration-ms) id
+                 (str "[" (name status) ", worker "
+                      (subs worker-id 0 (min 8 (count worker-id))) "]")))
+      (when (< jobs (:total report))
+        (println "  INCOMPLETE: missing jobs and unfinished durations are not measured")))))
+
 (defn- print-report! [report]
   (println "SHARD REPORT" (name (:overall report)))
   (println "Jobs:" (:total report) "Completed:" (:completed report))
   (doseq [status report-status-order]
     (println (format "  %-24s %d" (name status) (get-in report [:counts status]))))
+  (print-observed-summary! report)
   (when-let [{:keys [eligible measured missing invalid totals-ms slowest]}
              (:jvm-timing report)]
     (when (pos? eligible)
