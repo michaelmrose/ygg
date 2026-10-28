@@ -188,4 +188,13 @@
       ;; Test output uses ordinary stdout/stderr, not this framed side channel.
       (serve! (Channels/newInputStream channel)
               (Channels/newOutputStream channel)
-              identity))))
+              identity))
+    ;; The protocol's :stopped reply is a commitment to process termination,
+    ;; not merely to returning from this function. Real test namespaces can
+    ;; leave non-daemon Netty/XTDB/agent/service threads alive; clojure.main
+    ;; returning does not stop those threads. The socket is already closed
+    ;; here, after the only accepted clean shutdown. Exit this dedicated
+    ;; worker JVM explicitly so its supervising host can verify termination.
+    ;; Never call System/exit from serve!: caller-owned stream tests invoke it
+    ;; in-process and must retain ownership of their JVM.
+    (System/exit 0)))
