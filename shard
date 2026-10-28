@@ -1367,14 +1367,51 @@
 (def ^:private schedule-format :shard/schedule)
 
 (defn- worker-specs [clones jobs]
-  (let [runtimes (vec (sort (set (map :runtime jobs))))]
-    (require! (<= (count runtimes) (count clones))
+  ;; Every distinct runtime needs at least one isolated worker; use remaining
+  ;; clone capacity in proportion to its *actual* job count. Round-robin used
+  ;; to split N clones evenly between 138 Gesso JVM namespaces and six
+  ;; subprocess gates, needlessly leaving half the JVM parallelism idle.
+  ;; Largest remainders are deterministic; never allocate a worker to an
+  ;; absent runtime or let multiple runtimes share one writable clone.
+  (let [frequency (frequencies (map :runtime jobs))
+        runtimes (vec (sort (keys frequency)))
+        n (count clones)
+        groups (count runtimes)]
+    (require! (<= groups n)
               "More runtime groups than isolated workspaces")
-    (mapv (fn [i clone]
-            {:index (inc i)
-             :workspace (:mountpoint clone)
-             :runtime (nth runtimes (mod i (count runtimes)))})
-          (range (count clones)) clones)))
+    (require! (pos? groups) "Cannot allocate workers without jobs")
+    (let [extra (- n groups)
+          total (reduce + (vals frequency))
+          allocation (mapv (fn [runtime]
+                             (let [weighted (*' extra (frequency runtime))]
+                               {:runtime runtime
+                                :base (inc (quot weighted total))
+                                :remainder (mod weighted total)
+                                :weight (frequency runtime)}))
+                           runtimes)
+          missing (- n (reduce + (map :base allocation)))
+          bonus (set (map :runtime
+                          (take missing
+                                (sort-by (fn [{:keys [runtime remainder weight]}]
+                                           [(- remainder) (- weight) (str runtime)])
+                                         allocation))))
+          quotas (into {} (map (fn [{:keys [runtime base]}]
+                                 [runtime (+ base (if (contains? bonus runtime) 1 0))])
+                               allocation))
+          ;; Distribute the runtime groups through the clone list; the
+          ;; schedule remains a preference, not ownership of any job.
+          ordered (loop [remaining quotas, assigned []]
+                    (if (= n (count assigned))
+                      assigned
+                      (let [round (filterv #(pos? (get remaining % 0)) runtimes)]
+                        (recur (reduce #(update %1 %2 dec) remaining round)
+                               (into assigned round)))))]
+      (require! (= n (count ordered)) "Worker allocation did not fill clones")
+      (mapv (fn [i clone]
+              {:index (inc i)
+               :workspace (:mountpoint clone)
+               :runtime (nth ordered i)})
+            (range n) clones))))
 
 (defn- valid-queues? [queues specs jobs]
   (let [ids (mapcat identity queues)
