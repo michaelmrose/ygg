@@ -66,6 +66,20 @@
     "    try: os.write(fd, f'{kind}|{worker}|{runtime}|{pid}|{job}\\n'.encode())"
     "    finally: os.close(fd)"
     "event('START', 'scheduled' if rest else 'dynamic')"
+    ;; In the 138-JVM / six-gate scenario a fast machine can drain all 138
+    ;; JVM jobs before the coordinator polls a finished gate worker. That is
+    ;; correct scheduling but makes an unconditional handoff assertion flaky.
+    ;; Hold scheduled JVM workers until a *dynamic* JVM phase starts. A real
+    ;; handoff is now required for progress, not merely hoped for by timing.
+    "if mode == 'handoff-barrier' and runtime == 'jvm':"
+    "    marker = run / 'jvm-handoff-started'"
+    "    if not rest: marker.write_text(str(pid))"
+    "    else:"
+    "        deadline = time.monotonic() + 10.0"
+    "        while not marker.is_file() and time.monotonic() < deadline: time.sleep(0.02)"
+    "        if not marker.is_file():"
+    "            event('ERROR', 'no-jvm-handoff')"
+    "            sys.exit(19)"
     "if mode == 'many-handoffs' and runtime == 'jvm': time.sleep(0.75)"
     "if mode == 'abnormal' and runtime == 'gate':"
     "    event('ERROR')"
@@ -227,7 +241,7 @@
 (deftest n-worker-gesso-shaped-runtime-reassignment
   (doseq [n [2 4 8 16]]
     (testing (str "Gesso-shaped 138 JVM / six gate jobs, N=" n)
-      (let [scenario (make-scenario! n [[:jvm 138] [:gate 6]] :normal)]
+      (let [scenario (make-scenario! n [[:jvm 138] [:gate 6]] :handoff-barrier)]
         (try
           (let [specs ((:specs @coordinator) (:clones scenario) (:jobs scenario))
                 observed (exercise! scenario)]
