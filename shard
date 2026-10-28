@@ -1,5 +1,7 @@
 #!/usr/bin/env bb
-;; Shard: immutable run enumeration and filesystem-claimed subprocess workers.
+;; Shard: immutable run enumeration and filesystem-claimed workers.
+;; Persistent JVM runtime selection is staged and fail-closed until
+;; production sandbox/session admission is implemented.
 ;; Usage: ./shard enumerate CONFIG.edn NEW-RUN-DIR
 ;;        ./shard worker RUN-DIR WORKSPACE-DIR RUNTIME [MAX-IDLE-MS] [STACK-INDEX]
 ;;        ./shard report RUN-DIR [--edn]
@@ -10,7 +12,8 @@
          '[clojure.java.io :as io]
          '[clojure.java.shell :as shell]
          '[clojure.set :as set]
-         '[clojure.string :as str])
+         '[clojure.string :as str]
+         '[shard.runtime.jvm-session :as jvm-session])
 (import '[java.nio.file Files FileAlreadyExistsException LinkOption
           StandardCopyOption Path]
         '[java.nio.file.attribute FileAttribute PosixFilePermissions]
@@ -30,7 +33,9 @@
   #{:version :project-root :runtimes :jobs :inventory-command})
 (def ^:private allowed-job
   #{:id :gate :runtime :unit :command :depends-on :timeout-ms :requires})
-(def ^:private allowed-runtime #{:identity :capabilities})
+(def ^:private allowed-runtime
+  #{:identity :capabilities :execution :session-command})
+(def ^:private execution-modes #{:subprocess :persistent-jvm})
 
 (defn- fail! [message & [data]]
   (throw (ex-info message (or data {}))))
@@ -82,7 +87,17 @@
                    (not (str/blank? (:identity description))))
               "Runtime must declare a nonempty :identity" {:runtime name})
     (require! (keyword-set? (get description :capabilities #{}))
-              "Runtime :capabilities must be a set of keywords" {:runtime name}))
+              "Runtime :capabilities must be a set of keywords" {:runtime name})
+    (let [mode (get description :execution :subprocess)]
+      (require! (contains? execution-modes mode)
+                "Unknown runtime execution mode" {:runtime name :execution mode})
+      (if (= mode :persistent-jvm)
+        (require! (string-vector? (:session-command description))
+                  "Persistent JVM runtime requires :session-command argv"
+                  {:runtime name})
+        (require! (not (contains? description :session-command))
+                  "Subprocess runtime must not declare a persistent session command"
+                  {:runtime name}))))
   runtimes)
 
 (defn- validate-job! [job runtimes]
@@ -105,6 +120,13 @@
               "Job :requires must be a set of capability keywords" {:id id})
     (require! (set/subset? requires (get-in runtimes [runtime :capabilities] #{}))
               "Job requirements are not supported by its runtime" {:id id})
+    (when (= :persistent-jvm (get-in runtimes [runtime :execution]))
+      (require! (and (#{:gesso-jvm-namespace :clojure-namespace} (:type unit))
+                     (string? (:name unit))
+                     (boolean (re-matches #"[A-Za-z_][A-Za-z0-9_-]*(?:\.[A-Za-z_][A-Za-z0-9_-]*)+"
+                                          (:name unit))))
+                "Persistent JVM jobs require a valid namespace unit name"
+                {:id id :unit unit}))
     (assoc job :depends-on (vec (sort depends-on)))))
 
 (defn- acyclic! [jobs]
@@ -661,7 +683,41 @@
          :error (str (class ex) ": " (.getMessage ex))
          :duration-ms (long (/ (- (System/nanoTime) start) 1000000))}))))
 
-(defn- run-claimed-job! [run manifest workspace worker-env worker-id job blocked-reason]
+;; This adapter converts a previously CLAIMED namespace job into a command
+;; for an already established JVM session. The runtime owns the process;
+;; Shard owns job identity, claim arbitration, dependencies and reporting.
+;; The v1114 host session is TEST ONLY: production `shard worker` refuses any
+;; persistent runtime before its first claim until independently admitted
+;; Bubblewrap process-group sessions exist (later revision).
+(defn- persistent-execution! [job session logfile]
+  (let [started (System/nanoTime)
+        namespace (get-in job [:unit :name])
+        reply (jvm-session/run! session (:id job) namespace (:timeout-ms job))
+        duration-ms (long (/ (- (System/nanoTime) started) 1000000))]
+    ;; A per-job receipt is not the raw JVM stdout/stderr. Long-lived worker
+    ;; output is only reliably attributable at the SESSION level; later
+    ;; admission work must retain raw session logs without misattributing it.
+    (spit logfile (str "Persistent JVM result (test-only session):\n"
+                       (pr-str reply) "\n"
+                       "Raw stdout/stderr belong to the owning JVM session.\n"))
+    (case (:type reply)
+      :result {:status (:status reply)
+               :exit-code (if (= :passed (:status reply)) 0 1)
+               :duration-ms duration-ms}
+      :error {:status :execution-error :exit-code nil
+              :duration-ms duration-ms
+              :error (str "Persistent JVM error " (:reason reply)
+                          ": " (:message reply))}
+      (fail! "Unexpected persistent JVM command result"
+             {:job (:id job) :type (:type reply)}))))
+
+(defn- runtime-execution [manifest runtime]
+  (get-in manifest [:runtimes runtime :execution] :subprocess))
+
+(defn- run-claimed-job!
+  ([run manifest workspace worker-env worker-id job blocked-reason]
+   (run-claimed-job! run manifest workspace worker-env worker-id job blocked-reason nil))
+  ([run manifest workspace worker-env worker-id job blocked-reason session]
   (let [id (:id job)
         logfile (io/file run "logs" (str id ".log"))
         start (Instant/now)
@@ -670,7 +726,16 @@
                                        (pr-str (sort blocked-reason)) "\n"))
                      {:status :blocked :exit-code nil :duration-ms 0
                       :blocked-by (vec (sort blocked-reason))})
-                 (execute! run job workspace logfile worker-env))]
+                 (case (runtime-execution manifest (:runtime job))
+                   :subprocess
+                   (do (require! (nil? session)
+                                 "Subprocess job cannot use persistent JVM session")
+                       (execute! run job workspace logfile worker-env))
+                   :persistent-jvm
+                   (do (require! (some? session)
+                                 "Persistent JVM session not admitted; no subprocess fallback"
+                                 {:job id})
+                       (persistent-execution! job session logfile))))]
     ;; A test terminated by the worker's signal handler is NOT an ordinary
     ;; failed/passed test. Leave its claim incomplete for manual recovery.
     (require! (not @worker-interrupted?)
@@ -683,7 +748,7 @@
                              :completed-at (str (Instant/now))
                              :log (str "logs/" id ".log")}))
     (println "SHARD JOB" id (name (:status result)))
-    (flush)))
+    (flush))))
 
 (declare schedule-for-worker!)
 
@@ -709,7 +774,10 @@
                                    claim-startup-grace-ms))))))))
           (:jobs manifest))))
 
-(defn- worker! [run-path workspace-path runtime-name max-idle schedule-index]
+(defn- worker!
+  ([run-path workspace-path runtime-name max-idle schedule-index]
+   (worker! run-path workspace-path runtime-name max-idle schedule-index nil))
+  ([run-path workspace-path runtime-name max-idle schedule-index session]
   (let [run (.getCanonicalFile (io/file run-path))
         workspace (.getCanonicalFile (io/file workspace-path))
         manifest (read-manifest! run)
@@ -723,6 +791,23 @@
                     "Run basket must be outside the execution workspace")
         _ (require! (and (integer? max-idle) (<= 0 max-idle 86400000))
                     "MAX-IDLE-MS must be between 0 and 86400000")
+        ;; v1116 is the selection/accounting seam only. This test-injected
+        ;; session arity is intentionally unavailable through the public CLI.
+        ;; Production admission and group supervision are NOT established.
+        _ (case (runtime-execution manifest runtime)
+            :persistent-jvm
+            (do
+              (require! (some? session)
+                        "Persistent JVM production admission is not implemented; refusing before claim")
+              (require! (= (get-in session [:identity :runtime-fingerprint])
+                           (digest (canonical-edn
+                                    {:runtime runtime
+                                     :identity (get-in manifest [:runtimes runtime :identity])
+                                     :session-command (get-in manifest [:runtimes runtime :session-command])})))
+                        "Persistent JVM session fingerprint disagrees with declared runtime"))
+            :subprocess
+            (require! (nil? session)
+                      "Cannot inject a persistent session into subprocess runtime"))
         _ (sandbox-preflight! workspace)
         worker-id (str (UUID/randomUUID))
         worker-env (create-worker-environment! workspace worker-id)
@@ -757,7 +842,7 @@
           decision
           (let [[job blocked-reason] decision]
             (if (atomic-claim! run (:id job))
-              (do (run-claimed-job! run manifest workspace worker-env worker-id job blocked-reason)
+              (do (run-claimed-job! run manifest workspace worker-env worker-id job blocked-reason session)
                   (recur (System/currentTimeMillis)))
               (recur idle-start)))
 
@@ -781,7 +866,7 @@
           (do (println "SHARD WORKER IDLE" worker-id
                        "unresolved" (count outstanding)
                        "unclaimed" (count unclaimed))
-              (flush)))))))
+              (flush))))))))
 
 ;; Reporting reads only completed, immutable results. It never claims jobs,
 ;; releases claims, retries work, or mutates an active run.
