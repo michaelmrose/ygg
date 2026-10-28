@@ -1784,21 +1784,33 @@
 
 (def ^:private preflight-binding "GESSO_SHARD_PREFLIGHT_COMMIT")
 
-(defn- start-worker! [command run workspace runtime index admitted-head]
-  (let [log (io/file run (str "worker-" index ".log"))
-        argv (into command ["worker" (str run) (str workspace)
-                            (name runtime) "60000" (str index)])
-        b (ProcessBuilder. ^java.util.List argv)
-        env (.environment b)]
-    ;; Only this coordinator may transmit the preflighted source binding.
-    ;; Never inherit a caller-supplied binding for an unadmitted run.
-    (if admitted-head
-      (.put env preflight-binding admitted-head)
-      (.remove env preflight-binding))
-    (.directory b (io/file workspace))
-    (.redirectErrorStream b true)
-    (.redirectOutput b (ProcessBuilder$Redirect/to log))
-    {:index index :log log :process (.start b)}))
+(defn- start-worker!
+  ([command run workspace runtime index admitted-head]
+   (start-worker! command run workspace runtime index admitted-head 0))
+  ([command run workspace runtime index admitted-head phase]
+   ;; Each phase owns its clone exclusively. A reassigned worker may not use
+   ;; the original stack index: the published schedule's index is tied to its
+   ;; ORIGINAL runtime. Without an index, the replacement pulls compatible
+   ;; unclaimed jobs from the same immutable shared basket.
+   (require! (and (integer? phase) (<= 0 phase))
+             "Invalid worker phase")
+   (let [log (io/file run (if (zero? phase)
+                            (str "worker-" index ".log")
+                            (str "worker-" index "-phase-" phase ".log")))
+         argv (into command (cond-> ["worker" (str run) (str workspace)
+                                     (name runtime) "60000"]
+                              (zero? phase) (conj (str index))))
+         b (ProcessBuilder. ^java.util.List argv)
+         env (.environment b)]
+     ;; No preflight token supplied by an external caller is inherited.
+     (if admitted-head
+       (.put env preflight-binding admitted-head)
+       (.remove env preflight-binding))
+     (.directory b (io/file workspace))
+     (.redirectErrorStream b true)
+     (.redirectOutput b (ProcessBuilder$Redirect/to log))
+     {:index index :runtime runtime :phase phase :workspace workspace
+      :log log :process (.start b)})))
 
 (defn- terminate-workers! [workers]
   ;; SIGTERM gives each worker's shutdown hook time to kill its own detached
@@ -1810,8 +1822,32 @@
       (.destroyForcibly process)
       (.waitFor process 3 TimeUnit/SECONDS))))
 
+(defn- runtime-drained? [manifest results runtime]
+  ;; Reassignment is allowed only after EVERY job belonging to the exiting
+  ;; runtime has an immutable result, including failed and blocked jobs.
+  ;; Missing receipts/claimed-without-result must not cause a handoff.
+  (every? #(contains? results (:id %))
+          (filter #(= runtime (:runtime %)) (:jobs manifest))))
+
+(defn- reassignment-target [run manifest results exiting-runtime]
+  ;; Pick the largest compatible unfinished group with at least one *ready*
+  ;; unclaimed job. Immutable claims are never transferred, retried or stolen.
+  ;; Even a blocked job is ready for its terminal :blocked result once its
+  ;; unsuccessful prerequisite has produced a result.
+  (let [available (for [{:keys [id runtime depends-on]} (:jobs manifest)
+                        :when (and (not= runtime exiting-runtime)
+                                   (not (contains? results id))
+                                   (not (.exists (io/file run "claims" id)))
+                                   (every? #(contains? results %) depends-on))]
+                    runtime)]
+    (->> available frequencies
+         (sort-by (fn [[runtime n]] [(- n) (str runtime)]))
+         ffirst)))
+
 (defn- execute-workers! [run clones manifest admitted-head]
-  (let [;; Exactly one worker per writable clone, regardless of runtime.
+  (let [;; Exactly one concurrently running worker per writable clone.
+        ;; A clone may be reused serially after the previous runtime's
+        ;; receipts and process-group termination have been verified.
         specs (worker-specs clones (:jobs manifest))
         script (script-command!)
         started (atom [])
@@ -1819,25 +1855,87 @@
     (register-shutdown-hook!
       (fn []
         (try
-          (doseq [[i {:keys [workspace runtime]}] (map-indexed vector specs)]
-            (swap! started conj (start-worker! script run workspace runtime (inc i) admitted-head)))
-          (catch Exception ex
+          (let [active (reduce (fn [active {:keys [index workspace runtime]}]
+                                 (let [worker (start-worker! script run workspace
+                                                             runtime index admitted-head)]
+                                   (swap! started conj worker)
+                                   (assoc active index worker)))
+                               (sorted-map) specs)]
+            ;; Poll all children, not a sequential wait on stack index 1.
+            ;; That permits a short gate worker to hand off its workspace
+            ;; while a long-lived JVM worker continues testing.
+            (loop [active active, exits [], phases (zipmap (map :index specs)
+                                                            (repeat 0))]
+              (if (empty? active)
+                (do
+                  (require! (not @interrupted?)
+                            "Shard run interrupted; clones retained")
+                  (assert-no-running-sessions! run manifest)
+                  exits)
+                (let [finished (->> (vals active)
+                                    (filter (fn [{:keys [^Process process]}]
+                                              (not (.isAlive process))))
+                                    (sort-by :index) vec)]
+                  (if (empty? finished)
+                    (do (Thread/sleep 100)
+                        (recur active exits phases))
+                    (let [outcomes (mapv (fn [{:keys [index runtime phase log ^Process process]}]
+                                           {:worker index :runtime runtime :phase phase
+                                            :exit (.exitValue process) :log (str log)})
+                                         finished)
+                          _ (doseq [{:keys [worker runtime phase exit]} outcomes]
+                              (println "SHARD WORKER EXIT" worker
+                                       "runtime" runtime "phase" phase exit))
+                          _ (flush)
+                          _ (require! (every? #(zero? (:exit %)) outcomes)
+                                      "A Shard worker exited abnormally; clones retained"
+                                      {:workers outcomes})
+                          _ (require! (not @interrupted?)
+                                      "Shard run interrupted; clones retained")
+                          ;; Read immutable receipts after each observed exit.
+                          ;; A process that died without receipts cannot make
+                          ;; its workspace eligible for another runtime.
+                          results (read-results! run manifest)
+                          next-active (apply dissoc active (map :index finished))
+                          [next-active next-phases]
+                          (reduce
+                           (fn [[current phase-map] {:keys [index runtime workspace]}]
+                             (if (and (runtime-drained? manifest results runtime)
+                                      ;; Do not inspect group-wide process
+                                      ;; sessions while a sibling worker from
+                                      ;; the old runtime is still alive.
+                                      (not-any? #(= runtime (:runtime %))
+                                                (vals current)))
+                               (let [target (reassignment-target run manifest results runtime)]
+                                 (if target
+                                   (do
+                                     ;; The old process has exited cleanly and
+                                     ;; all of its runtime's claimed jobs have
+                                     ;; results. For subprocess jobs this
+                                     ;; additionally checks EVERY process
+                                     ;; group, so detached descendants cannot
+                                     ;; survive a clone handoff.
+                                     (assert-no-running-sessions!
+                                      run (assoc manifest :jobs
+                                                 (filterv #(= runtime (:runtime %))
+                                                          (:jobs manifest))))
+                                     (let [phase (inc (get phase-map index 0))
+                                           worker (start-worker! script run workspace
+                                                                 target index admitted-head phase)]
+                                       (swap! started conj worker)
+                                       (println "SHARD WORKER HANDOFF" index
+                                                (name runtime) "->" (name target)
+                                                "phase" phase)
+                                       (flush)
+                                       [(assoc current index worker)
+                                        (assoc phase-map index phase)]))
+                                   [current phase-map]))
+                               [current phase-map]))
+                           [next-active phases] finished)]
+                      (recur next-active (into exits outcomes) next-phases)))))))
+          (catch Throwable ex
             (terminate-workers! @started)
-            (fail! "Could not start every Shard worker; clones retained"
-                   {:cause (.getMessage ex)})))
-        (let [exits (mapv (fn [{:keys [index log ^Process process]}]
-                            {:worker index :exit (.waitFor process) :log (str log)})
-                          @started)]
-          (doseq [{:keys [worker exit]} exits]
-            (println "SHARD WORKER EXIT" worker exit))
-          (flush)
-          (require! (not @interrupted?)
-                    "Shard run interrupted; clones retained")
-          (require! (every? #(zero? (:exit %)) exits)
-                    "A Shard worker exited abnormally; clones retained"
-                    {:workers exits})
-          (assert-no-running-sessions! run manifest)
-          exits))
+            (throw ex))))
       (fn []
         (reset! interrupted? true)
         (binding [*out* *err*]
