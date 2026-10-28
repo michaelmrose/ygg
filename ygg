@@ -1,6 +1,6 @@
 #!/usr/bin/env bb
 ;; Ygg: conservative ZFS workspace clones for a repository at a dataset root.
-;; Usage: ygg [-n N] create | status [--edn] | clean [REPO]
+;; Usage: ygg [-n N] create | status [--edn] | clean | tail [--workers|--stderr|--all] [--run PATH] [--once]
 ;; Clone mountpoints: REPO/.ygg/workers/1 ... N; run results: REPO/.ygg/runs/.
 ;; Shard holds an exclusive FileChannel lock on .ygg/.workers.lock while using
 ;; the clones. Ygg clean refuses to proceed while that lock is held.
@@ -13,6 +13,9 @@
          '[clojure.string :as str])
 (import '[java.nio.channels FileChannel]
         '[java.nio.file Files LinkOption OpenOption StandardOpenOption]
+        '[java.io ByteArrayOutputStream RandomAccessFile]
+        '[java.nio.charset StandardCharsets]
+        '[java.nio.file.attribute BasicFileAttributes]
         '[java.time Instant ZoneId]
         '[java.time.format DateTimeFormatter]
         '[java.util UUID])
@@ -298,6 +301,174 @@
         (do (println "Origin snapshot:" (:snapshot status) "(retained on clean)")
             (doseq [clone (:clones status)]
               (println (:dataset clone) "->" (:mountpoint clone) "[verified mounted]")))))))
+
+;; Live run output is a read-only operation: no ZFS command, sudo, FileChannel
+;; lock, or mutable job receipt is involved. The authoritative logs and manifest
+;; remain under the project-owned .ygg/runs/<run-id> directory.
+(def ^:private tail-run-name #"run-[A-Za-z0-9][A-Za-z0-9_-]*")
+(def ^:private tail-jvm-name
+  #"jvm-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(stdout|stderr)\.log")
+(def ^:private tail-worker-name #"worker-([1-9][0-9]*)(?:-phase-([1-9][0-9]*))?\.log")
+
+(defn- tail-ordinary-dir! [path]
+  (when-not (Files/isDirectory (if (instance? java.nio.file.Path path)
+                                 path (.toPath (io/file path))) no-follow)
+    (fail! (str "Missing or unsafe run directory: " path))))
+
+(defn- tail-run! [root specified]
+  (let [w (workspace root)
+        runs (f w "runs")
+        _ (tail-ordinary-dir! w)
+        _ (tail-ordinary-dir! runs)
+        runs-path (.toAbsolutePath (.normalize (.toPath runs)))
+        requested (if specified
+                    (let [p (.toPath (io/file specified))]
+                      (if (and (= 1 (.getNameCount p))
+                               (re-matches tail-run-name (str p)))
+                        (.resolve runs-path p)
+                        (.toAbsolutePath p)))
+                    (let [latest (.resolve runs-path "latest")]
+                      (when-not (Files/isSymbolicLink latest)
+                        (fail! (str "No published latest Ygg run in " runs)))
+                      (let [target (Files/readSymbolicLink latest)]
+                        (when-not (and (not (.isAbsolute target))
+                                       (= 1 (.getNameCount target))
+                                       (re-matches tail-run-name (str target)))
+                          (fail! "Unsafe .ygg/runs/latest target"))
+                        (.resolve runs-path target))))
+        run (.normalize requested)]
+    (when-not (and (= runs-path (.getParent run))
+                   (re-matches tail-run-name (str (.getFileName run))))
+      (fail! "Selected run must be a direct child of .ygg/runs"
+             {:run (str run)}))
+    (tail-ordinary-dir! run)
+    (let [manifest (.resolve run "jobs.edn")
+          logs (.resolve run "logs")]
+      (when-not (Files/isRegularFile manifest no-follow)
+        (fail! "Run has no published, regular jobs.edn"))
+      (tail-ordinary-dir! logs))
+    run))
+
+(defn- tail-regular-files [directory filename-pattern]
+  (with-open [files (Files/list (if (instance? java.nio.file.Path directory)
+                                  directory (.toPath (io/file directory))))]
+    (->> (iterator-seq (.iterator files))
+         (filter #(re-matches filename-pattern (str (.getFileName %))))
+         (map (fn [path]
+                (when-not (Files/isRegularFile path no-follow)
+                  (fail! "Refusing non-regular or symlinked tail log"
+                         {:path (str path)}))
+                path))
+         (sort-by str)
+         vec)))
+
+(defn- tail-worker-ids [run]
+  (into {}
+        (keep (fn [p]
+                (let [[_ index phase] (re-matches tail-worker-name
+                                                   (str (.getFileName p)))]
+                  (try
+                    (with-open [r (io/reader (.toFile p))]
+                      (when-let [header (.readLine r)]
+                        (when-let [[_ uuid]
+                                   (re-find #"^SHARD WORKER ([0-9a-f-]{36})\b" header)]
+                          [uuid (str "worker-" index
+                                     (when phase (str "-phase-" phase)))])))
+                    (catch java.io.FileNotFoundException _ nil))))
+              (tail-regular-files run tail-worker-name))))
+
+(defn- tail-sources [run mode worker-ids]
+  (let [workers (when (#{:workers :all} mode)
+                  (for [p (tail-regular-files run tail-worker-name)]
+                    {:path p :label (str (.getFileName p))}))
+        jvms (when (#{:jvm :stderr :all} mode)
+               (for [p (tail-regular-files (.resolve run "logs") tail-jvm-name)
+                     :let [[_ uuid stream] (re-matches tail-jvm-name
+                                                          (str (.getFileName p)))]
+                     :when (or (not= mode :stderr) (= stream "stderr"))]
+                 {:path p
+                  :label (str (get worker-ids uuid (str "jvm-" (subs uuid 0 8)))
+                              "/" stream)}))]
+    (vec (concat workers jvms))))
+
+(defn- tail-initial-offset [path lines]
+  ;; Find the last N lines without loading a potentially multi-GB JVM log.
+  (with-open [r (RandomAccessFile. (.toFile path) "r")]
+    (let [length (.length r)
+          _ (when (pos? length) (.seek r (dec length)))
+          terminal-newline? (and (pos? length) (= 10 (.readUnsignedByte r)))
+          target (+ lines (if terminal-newline? 1 0))]
+      (loop [end length, seen 0]
+        (if (zero? end)
+          0
+          (let [start (max 0 (- end 4096))
+                bytes (byte-array (int (- end start)))]
+            (.seek r start)
+            (.readFully r bytes)
+            (if-let [offset
+                     (loop [i (dec (alength bytes)), count seen]
+                       (when (>= i 0)
+                         (if (= 10 (bit-and 0xff (aget bytes i)))
+                           (if (= (inc count) target)
+                             (+ start i 1)
+                             (recur (dec i) (inc count)))
+                           (recur (dec i) count))))]
+              offset
+              (recur start (+ seen (count (filter #(= 10 (bit-and 0xff %)) bytes)))))))))))
+
+(defn- tail-poll-file! [path {:keys [offset partial file-key]} label]
+  (try
+    (with-open [r (RandomAccessFile. (.toFile path) "r")]
+      (let [length (.length r)
+            current-key (.fileKey (Files/readAttributes path BasicFileAttributes no-follow))
+            restarted? (or (< length offset)
+                           (and file-key current-key (not= file-key current-key)))
+            ^ByteArrayOutputStream pending (if restarted? (ByteArrayOutputStream.) partial)
+            from (if restarted? 0 offset)
+            bytes (byte-array 8192)]
+        (.seek r from)
+        (loop [position from]
+          (let [n (.read r bytes)]
+            (if (pos? n)
+              (do
+                (dotimes [i n]
+                  (let [b (bit-and 0xff (aget bytes i))]
+                    (if (= b 10)
+                      (let [line (String. (.toByteArray pending)
+                                          StandardCharsets/UTF_8)]
+                        (println (str "[" label "] "
+                                      (str/replace line #"\r$" "")))
+                        (.reset pending))
+                      (.write pending b))))
+                (recur (+ position n)))
+              {:offset position :partial pending :file-key current-key})))))
+    (catch java.io.FileNotFoundException _
+      ;; A file may disappear between the directory listing and opening it.
+      {:offset 0 :partial (ByteArrayOutputStream.)})))
+
+(defn- tail! [root {:keys [run mode once?]}]
+  (let [selected (tail-run! root run)
+        mode (or mode :jvm)]
+    (println "YGG TAIL" (str selected) "mode" (name mode)
+             (if once? "snapshot" "following (Ctrl-C to stop)"))
+    (flush)
+    (loop [known {}, first-scan? true]
+      (let [worker-ids (tail-worker-ids selected)
+            files (tail-sources selected mode worker-ids)
+            next-known
+            (reduce (fn [state {:keys [path label]}]
+                      (let [old (get known path)
+                            start (or old {:offset (if first-scan?
+                                                      (tail-initial-offset path 10)
+                                                      0)
+                                           :partial (ByteArrayOutputStream.)})]
+                        (assoc state path (tail-poll-file! path start label))))
+                    {} files)]
+        (flush)
+        (when-not once?
+          (Thread/sleep 350)
+          (recur next-known false))))))
+
 (defn- parse-args [argv]
   (loop [xs (seq argv) parsed {}]
     (if (empty? xs)
@@ -310,10 +481,21 @@
                            (catch Exception _ (fail! "-n must be integer")))]
                 (when-not (<= 1 n 256) (fail! "-n must be 1 through 256"))
                 (recur (nnext xs) (assoc parsed :n n))))
+          (= "--run" x)
+          (do (when (or (not (second xs)) (:run parsed)) (fail! "Missing or duplicate --run"))
+              (recur (nnext xs) (assoc parsed :run (second xs))))
+          (= "--once" x)
+          (do (when (:once? parsed) (fail! "Duplicate --once"))
+              (recur (next xs) (assoc parsed :once? true)))
+          (#{"--workers" "--stderr" "--all"} x)
+          (do (when (:mode parsed) (fail! "Only one tail output mode is allowed"))
+              (recur (next xs) (assoc parsed :mode ({"--workers" :workers
+                                                     "--stderr" :stderr
+                                                     "--all" :all} x))))
           (= "--edn" x)
           (do (when (:edn? parsed) (fail! "Duplicate --edn"))
               (recur (next xs) (assoc parsed :edn? true)))
-          (#{"create" "clean" "status"} x)
+          (#{"create" "clean" "status" "tail"} x)
           (do (when (:action parsed) (fail! "Multiple actions"))
               (recur (next xs) (assoc parsed :action (keyword x))))
           (str/starts-with? x "-") (fail! (str "Unrecognized option: " x))
@@ -359,17 +541,23 @@
         action (or (:action cli) (:action config))
         n (or (:n cli) (:n config) 1)]
     (when-not (.isDirectory (io/file root)) (fail! "Not a directory"))
-    (when-not (#{:create :clean :status} action)
-      (fail! "Specify create, clean, status or :action in ygg.edn"))
+    (when-not (#{:create :clean :status :tail} action)
+      (fail! "Specify create, clean, status, tail or :action in ygg.edn"))
     (when-not (and (integer? n) (<= 1 n 256))
       (fail! "Clone count must be 1..256"))
     (when (and (:edn? cli) (not= action :status))
       (fail! "--edn is supported only for status"))
-    (let [source (source-dataset root)]
-      (with-lock root #(case action
-                         :create (with-worker-idle root (fn [] (create! root source n)))
-                         :clean (with-worker-idle root (fn [] (clean! root source)))
-                         :status (status! root source (:edn? cli)))))))
+    (when (and (not= action :tail) (some? (some cli [:mode :run :once?])))
+      (fail! "Tail options are supported only for tail"))
+    (when (and (= action :tail) (:n cli))
+      (fail! "-n is not supported for tail"))
+    (if (= action :tail)
+      (tail! root cli)
+      (let [source (source-dataset root)]
+        (with-lock root #(case action
+                           :create (with-worker-idle root (fn [] (create! root source n)))
+                           :clean (with-worker-idle root (fn [] (clean! root source)))
+                           :status (status! root source (:edn? cli))))))))
 (try
   (apply -main *command-line-args*)
   (catch Exception e
