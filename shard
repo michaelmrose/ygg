@@ -1865,7 +1865,12 @@
             ;; That permits a short gate worker to hand off its workspace
             ;; while a long-lived JVM worker continues testing.
             (loop [active active, exits [], phases (zipmap (map :index specs)
-                                                            (repeat 0))]
+                                                            (repeat 0))
+                   ;; An early, successful worker exit does not forfeit its
+                   ;; clone. It may become eligible for handoff only AFTER
+                   ;; every job of its original runtime has a terminal
+                   ;; receipt and all sibling workers have exited.
+                   retired (sorted-map)]
               (if (empty? active)
                 (do
                   (require! (not @interrupted?)
@@ -1878,7 +1883,7 @@
                                     (sort-by :index) vec)]
                   (if (empty? finished)
                     (do (Thread/sleep 100)
-                        (recur active exits phases))
+                        (recur active exits phases retired))
                     (let [outcomes (mapv (fn [{:keys [index runtime phase log ^Process process]}]
                                            {:worker index :runtime runtime :phase phase
                                             :exit (.exitValue process) :log (str log)})
@@ -1897,42 +1902,47 @@
                           ;; its workspace eligible for another runtime.
                           results (read-results! run manifest)
                           next-active (apply dissoc active (map :index finished))
-                          [next-active next-phases]
+                          ;; Keep exited clone slots for later reconsideration.
+                          ;; They must not be relaunched merely because their
+                          ;; own worker exited: another member of the same
+                          ;; runtime may still be executing a claimed job.
+                          retired-candidates
+                          (reduce (fn [idle {:keys [index runtime workspace]}]
+                                    (assoc idle index {:index index
+                                                       :runtime runtime
+                                                       :workspace workspace}))
+                                  retired finished)
+                          [next-active next-phases next-retired]
                           (reduce
-                           (fn [[current phase-map] {:keys [index runtime workspace]}]
+                           (fn [[current phase-map idle] [index {:keys [runtime workspace]}]]
                              (if (and (runtime-drained? manifest results runtime)
-                                      ;; Do not inspect group-wide process
-                                      ;; sessions while a sibling worker from
-                                      ;; the old runtime is still alive.
+                                      ;; The outgoing runtime must have no
+                                      ;; surviving workers before clone reuse.
                                       (not-any? #(= runtime (:runtime %))
                                                 (vals current)))
-                               (let [target (reassignment-target run manifest results runtime)]
-                                 (if target
-                                   (do
-                                     ;; The old process has exited cleanly and
-                                     ;; all of its runtime's claimed jobs have
-                                     ;; results. For subprocess jobs this
-                                     ;; additionally checks EVERY process
-                                     ;; group, so detached descendants cannot
-                                     ;; survive a clone handoff.
-                                     (assert-no-running-sessions!
-                                      run (assoc manifest :jobs
-                                                 (filterv #(= runtime (:runtime %))
-                                                          (:jobs manifest))))
-                                     (let [phase (inc (get phase-map index 0))
-                                           worker (start-worker! script run workspace
-                                                                 target index admitted-head phase)]
-                                       (swap! started conj worker)
-                                       (println "SHARD WORKER HANDOFF" index
-                                                (name runtime) "->" (name target)
-                                                "phase" phase)
-                                       (flush)
-                                       [(assoc current index worker)
-                                        (assoc phase-map index phase)]))
-                                   [current phase-map]))
-                               [current phase-map]))
-                           [next-active phases] finished)]
-                      (recur next-active (into exits outcomes) next-phases)))))))
+                               (if-let [target (reassignment-target run manifest results runtime)]
+                                 (do
+                                   (assert-no-running-sessions!
+                                    run (assoc manifest :jobs
+                                               (filterv #(= runtime (:runtime %))
+                                                        (:jobs manifest))))
+                                   (let [phase (inc (get phase-map index 0))
+                                         worker (start-worker! script run workspace
+                                                               target index admitted-head phase)]
+                                     (swap! started conj worker)
+                                     (println "SHARD WORKER HANDOFF" index
+                                              (name runtime) "->" (name target)
+                                              "phase" phase)
+                                     (flush)
+                                     [(assoc current index worker)
+                                      (assoc phase-map index phase)
+                                      (dissoc idle index)]))
+                                 [current phase-map idle])
+                               [current phase-map idle]))
+                           [next-active phases retired-candidates]
+                           retired-candidates)]
+                      (recur next-active (into exits outcomes)
+                             next-phases next-retired)))))))
           (catch Throwable ex
             (terminate-workers! @started)
             (throw ex))))
