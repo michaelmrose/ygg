@@ -1,5 +1,5 @@
 (ns shard.runtime.jvm-session
-  "Host-side, test-only first implementation of a persistent JVM session.
+  "Host-side, supervised persistent JVM session for test-only or admitted execution.
 
   A host launches ONE JVM, accepts its connection on a private Unix-domain
   socket, validates the launch handshake and then runs several independently
@@ -7,21 +7,24 @@
   claims jobs or reports a run as complete: Shard's external supervisor owns
   the immutable inventory, atomic claims, scheduling, logs and reconciliation.
 
-  SECURITY BOUNDARY (v1114): `start!` admits ONLY :test-only? true. It does not
-  implement Bubblewrap admission or independently attest a runtime fingerprint;
-  therefore it MUST NOT be used in a production Shard run. Subsequent revisions
-  must bind the process to an admitted sandbox and verified runtime identity.
+  In production, start! requires a complete :admission configuration. It
+  executes the native admission probe, starts precisely the validated
+  Bubblewrap/setsid invocation, checks process-group and namespace PID
+  correspondence, and supervises the entire process group. No production
+  bypass through :test-only? is allowed by the Shard CLI.
 
-  Per-command timeout, socket corruption, unexpected EOF, and shutdown failure
-  POISON the session. This version kills the direct child as a test-only safety
-  precaution, NOT as proof of complete descendant/process-group termination.
-  Production use must wait for supervised process-group teardown and evidence."
+  Per-command timeout, socket corruption, unexpected EOF and shutdown failure
+  POISON the session. If group cleanup cannot be verified, the session remains
+  unsafe for workspace cleanup and the exception is retained."
   (:refer-clojure :exclude [run!])
-  (:require [shard.protocol :as protocol])
+  (:require [clojure.string :as str]
+            [shard.protocol :as protocol]
+            [shard.runtime.admission :as admission])
   (:import [java.io File InputStream OutputStream]
            [java.net StandardProtocolFamily UnixDomainSocketAddress]
            [java.nio.channels Channels ServerSocketChannel SocketChannel]
-           [java.nio.file Files Path]
+           [java.nio.file Files Path LinkOption]
+           [java.nio.file.attribute PosixFilePermission]
            [java.util.concurrent TimeUnit]))
 
 (def ^:private default-startup-ms 20000)
@@ -54,14 +57,126 @@
     (try (.close ^java.lang.AutoCloseable closeable)
          (catch Exception _ nil))))
 
+(def ^:private no-follow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+(def ^:private namespace-names ["user" "ipc" "pid" "net" "mnt"])
+
+(defn- host-ns [name]
+  (str (Files/readSymbolicLink
+        (Path/of (str "/proc/self/ns/" name) (make-array String 0)))))
+
+(defn- proc-details [pid]
+  (let [base (Path/of (str "/proc/" pid) (make-array String 0))
+        stat (.resolve base "stat")
+        status (.resolve base "status")]
+    (try
+      (let [raw (Files/readString stat)
+            i (.lastIndexOf raw ")")
+            _ (require-valid! (pos? i) :proc-unavailable "Malformed process status")
+            fields (str/split (subs raw (+ i 2)) #"\s+")
+            _ (require-valid! (>= (count fields) 3) :proc-unavailable "Malformed process group")
+            text (Files/readString status)
+            pid-line (some #(when (str/starts-with? % "NSpid:") %)
+                           (str/split-lines text))
+            ns-pids (when pid-line
+                      (mapv #(Long/parseLong %)
+                            (re-seq #"[0-9]+" pid-line)))]
+        {:pid (long pid) :state (first fields)
+         :pgid (Long/parseLong (nth fields 2))
+         :ns-pids ns-pids :base base})
+      (catch java.nio.file.NoSuchFileException _ nil)
+      (catch java.io.IOException e
+        (if (Files/exists stat no-follow)
+          (refuse! :proc-unavailable "Cannot inspect process status"
+                   {:pid pid :cause (.getMessage e)})
+          nil)))))
+
+(defn- group-members! [pgid]
+  (let [entries (.listFiles (File. "/proc"))]
+    (require-valid! (some? entries) :proc-unavailable "Cannot enumerate /proc")
+    (into [] (keep (fn [^File f]
+                     (when (re-matches #"[0-9]+" (.getName f))
+                       (when-let [details (proc-details (Long/parseLong (.getName f)))]
+                         (when (and (= pgid (:pgid details))
+                                    (not (#{"Z" "X"} (:state details))))
+                           details))))) entries)))
+
+(defn- signal-group! [signal pgid]
+  (let [p (.start (ProcessBuilder. ^java.util.List
+                                   ["kill" (str "-" signal) "--" (str "-" pgid)]))]
+    (require-valid! (.waitFor p 3 TimeUnit/SECONDS)
+                    :termination-unverified "Group signal helper did not exit")
+    (zero? (.exitValue p))))
+
+(defn- verify-group-leader! [^Process process]
+  (let [pid (.pid process)]
+    ;; setsid may not have execed when ProcessBuilder.start returns. Wait
+    ;; briefly for the new PGID, never signal an unverified inherited group.
+    (loop [attempt 0]
+      (let [details (proc-details pid)]
+        (cond
+          (and details (= pid (:pgid details))) pid
+          (or (not (.isAlive process)) (>= attempt 100))
+          (refuse! :group-unverified
+                   "Bubblewrap wrapper did not establish its own process group"
+                   {:pid pid})
+          :else (do (Thread/sleep 10) (recur (inc attempt))))))))
+
 (defn- stop-child!
-  "Test-only direct-child teardown. Never treated as process-group evidence."
-  [^Process process]
+  "Terminate a test child directly, or a production process group; refuse
+  to claim complete teardown unless no live group members remain."
+  [^Process process admitted?]
   (when process
-    (when (.isAlive process)
-      (.destroyForcibly process))
-    (when-not (.waitFor process 5 TimeUnit/SECONDS)
-      (refuse! :termination-unverified "JVM child has not terminated" {:pid (.pid process)}))))
+    (if-not admitted?
+      (do (when (.isAlive process) (.destroyForcibly process))
+          (require-valid! (.waitFor process 5 TimeUnit/SECONDS)
+                          :termination-unverified "Test JVM child has not terminated"))
+      (let [pgid (.pid process)]
+        ;; Signal only a known group. Failure here MUST NOT be called cleanup.
+        (when (.isAlive process)
+          (try
+            (verify-group-leader! process)
+            (catch Throwable t
+              ;; Unknown PGID: never send a negative-PID group signal. Try
+              ;; best-effort direct/descendant teardown, but preserve the
+              ;; original refusal as an unverified safety boundary.
+              (doseq [^java.lang.ProcessHandle child (iterator-seq
+                                            (.iterator (.descendants (.toHandle process))))]
+                (.destroyForcibly child))
+              (.destroyForcibly process)
+              (.waitFor process 2 TimeUnit/SECONDS)
+              (throw t))))
+        (when (seq (group-members! pgid))
+          (signal-group! "TERM" pgid))
+        (.waitFor process 1 TimeUnit/SECONDS)
+        (when (seq (group-members! pgid))
+          (signal-group! "KILL" pgid))
+        (.waitFor process 2 TimeUnit/SECONDS)
+        (loop [tries 0]
+          (let [live (group-members! pgid)]
+            (when (seq live)
+              (require-valid! (< tries 20) :termination-unverified
+                              "Production JVM descendants remain alive")
+              (Thread/sleep 100)
+              (recur (inc tries)))))
+        (require-valid! (not (.isAlive process)) :termination-unverified
+                        "Sandbox group wrapper has not terminated")))))
+
+(defn- attest-jvm-pid! [session namespace-pid]
+  (let [pgid (:process-group session)
+        members (group-members! pgid)
+        matches (filterv
+                 (fn [{:keys [pid ns-pids]}]
+                   (and (> (count ns-pids) 1)
+                        (= namespace-pid (peek ns-pids))
+                        (every? (fn [name]
+                                  (not= (host-ns name)
+                                        (str (Files/readSymbolicLink
+                                              (Path/of (str "/proc/" pid "/ns/" name)
+                                                       (make-array String 0))))))
+                                namespace-names))) members)]
+    (require-valid! (= 1 (count matches)) :pid
+                    "Cannot uniquely attest JVM PID inside isolated namespaces")
+    (:pid (first matches))))
 
 (defn- release-transport! [session]
   (close-quietly! (:channel session))
@@ -73,11 +188,11 @@
     (Files/deleteIfExists dir)))
 
 (defn- poison!
-  "Invalidate session before stopping a failed test-only child."
+  "Invalidate before teardown; do not clean sockets if descendants remain."
   [session]
   (reset! (:phase session) :poisoned)
   (release-transport! session)
-  (stop-child! (:process session))
+  (stop-child! (:process session) (:admitted? session))
   (cleanup-socket! session))
 
 (defn- accept-before! [^ServerSocketChannel listener ^Process process timeout-ms]
@@ -133,8 +248,19 @@
                {:field field :seq (:seq request)})))
   (require-valid! (= (:seq request) (:seq reply)) :sequence
                   "JVM reply has wrong command sequence")
-  (require-valid! (= (.pid ^Process (:process session)) (:pid reply)) :pid
-                  "JVM reply PID is not the launched process")
+  (if (:admitted? session)
+    (if (= :ready (:type reply))
+      (let [host-pid (attest-jvm-pid! session (:pid reply))]
+        (reset! (:attested-host-pid session) host-pid))
+      (do
+        (require-valid! (= (:namespace-pid session) (:pid reply)) :pid
+                        "Reply JVM PID changed within isolated namespace")
+        (when-not (= :stopped (:type reply))
+          (require-valid! (= @(:attested-host-pid session)
+                             (attest-jvm-pid! session (:pid reply))) :pid
+                          "Host JVM process identity changed"))))
+    (require-valid! (= (.pid ^Process (:process session)) (:pid reply)) :pid
+                    "JVM reply PID is not the launched process"))
   (require-valid! (expected-type (:type reply)) :unexpected-response
                   "Unexpected JVM reply type")
   reply)
@@ -150,23 +276,20 @@
   reply)
 
 (defn start!
-  "Start ONE test-only JVM and establish its typed control session.
+  "Start one persistent JVM with an explicit trust boundary.
 
-  Requires {:test-only? true, :command [string ...], :cwd path,
-  :control-dir path, :stdout-file path, :stderr-file path, :worker-id string,
-  :runtime-fingerprint 64-hex-string}. Optional :startup-timeout-ms and
-  :shutdown-timeout-ms are positive millisecond bounds.
+  TEST: :test-only? true uses a direct JVM, never a production claim token.
+  PRODUCTION: :admission must contain owned :workspace, :run-dir,
+  :control-dir, :worker-env and permitted sandbox binaries. A genuine probe
+  MUST succeed before launching the sandboxed JVM. :cwd/:control-dir must
+  match the owned clone configuration. No unsandboxed fallback exists.
 
-  The caller MUST supply a real JVM command loading shard.worker.jvm, usually
-  [java -cp <classpath> clojure.main -m shard.worker.jvm]. All test stdout and
-  stderr go to distinct caller-selected files. No shell is involved.
-
-  The returned session is mutable and MUST be closed via stop! or abort!.
-  It is NOT an admission token and MUST NOT be used as proof of sandboxing."
-  [{:keys [test-only? command cwd control-dir stdout-file stderr-file
+  The caller must stop!/abort! every returned session and retain workspaces
+  when termination evidence is missing. This function does not claim jobs."
+  [{:keys [test-only? admission command cwd control-dir stdout-file stderr-file
            worker-id runtime-fingerprint startup-timeout-ms shutdown-timeout-ms]}]
-  (require-valid! (true? test-only?) :not-admitted
-                  "v1114 JVM launcher is test-only; production sandbox admission is not implemented")
+  (require-valid! (not= (true? test-only?) (some? admission)) :not-admitted
+                  "Choose exactly one of explicit test-only or native admission")
   (require-valid! (and (vector? command) (seq command)
                        (every? #(and (string? %) (not (empty? %))) command))
                   :configuration "JVM command must be a nonempty vector of strings")
@@ -180,7 +303,16 @@
                   :worker-id worker-id :runtime-fingerprint runtime-fingerprint}
         _ (protocol/validate-message!
            (merge {:version protocol/protocol-version :type :hello :seq 0} identity)
-           :host-to-worker)]
+           :host-to-worker)
+        admitted? (some? admission)
+        _ (when admitted?
+            (require-valid! (map? admission) :configuration
+                            "Production admission options must be a map")
+            (require-valid! (= (path! (:workspace admission) :workspace) cwd)
+                            :configuration "Session cwd must equal admitted workspace")
+            (require-valid! (= (path! (:control-dir admission) :control-dir)
+                               control-dir)
+                            :configuration "Session control dir must be admitted"))]
     (require-valid! (Files/isDirectory cwd (make-array java.nio.file.LinkOption 0))
                     :configuration "Working directory does not exist")
     (require-valid! (Files/isDirectory control-dir (make-array java.nio.file.LinkOption 0))
@@ -189,23 +321,36 @@
                          (Files/isDirectory (.getParent stdout) (make-array java.nio.file.LinkOption 0))
                          (Files/isDirectory (.getParent stderr) (make-array java.nio.file.LinkOption 0)))
                     :configuration "Independent log parent directories must exist")
-    ;; Only caller-specified values are forwarded; mandatory identity overrides
-    ;; any inherited environment and is never taken from untrusted job input.
-    (let [socket-dir (Files/createTempDirectory control-dir "jvm-session-"
+    ;; A successful probe alone is not admission of the later JVM. The exact
+    ;; launch plan and live process/PID must also be attested before :active.
+    ;; This runs BEFORE socket creation or process startup.
+    (let [launch (when admitted?
+                   (let [options (assoc admission :command command)
+                         checked-before (admission/plan! options)
+                         _ (admission/probe! options)
+                         checked-after (admission/plan! options)]
+                     (require-valid! (= checked-before checked-after)
+                                     :admission-changed
+                                     "Sandbox plan changed between probe and launch")
+                     checked-after))
+          socket-dir (Files/createTempDirectory control-dir "jvm-session-"
                                                (make-array java.nio.file.attribute.FileAttribute 0))
           listener (atom nil)
           process (atom nil)
           channel (atom nil)
           session-base {:identity identity :socket-dir socket-dir
+                        :admitted? admitted?
                         :startup-timeout-ms startup-ms :shutdown-timeout-ms shutdown-ms}]
       (try
         (let [socket (.resolve socket-dir "control.sock")
               server (ServerSocketChannel/open StandardProtocolFamily/UNIX)]
           (reset! listener server)
           (.bind server (UnixDomainSocketAddress/of socket))
-          (let [builder (ProcessBuilder. ^java.util.List command)
+          (let [builder (ProcessBuilder. ^java.util.List
+                                         (if admitted? (:argv launch) command))
                 env (.environment builder)]
             (.directory builder (.toFile cwd))
+            (when admitted? (.putAll env (:env launch)))
             (.redirectOutput builder (.toFile stdout))
             (.redirectError builder (.toFile stderr))
             (.put env "SHARD_CONTROL_SOCKET" (str socket))
@@ -213,12 +358,15 @@
             (.put env "SHARD_WORKER_ID" worker-id)
             (.put env "SHARD_RUNTIME_FINGERPRINT" runtime-fingerprint)
             (reset! process (.start builder)))
+          (when admitted? (verify-group-leader! @process))
           (reset! channel (accept-before! server @process startup-ms))
           (let [session (assoc session-base
                                :listener server :process @process :channel @channel
                                :input (Channels/newInputStream ^SocketChannel @channel)
                                :output (Channels/newOutputStream ^SocketChannel @channel)
                                :phase (atom :starting)
+                               :process-group (when admitted? (.pid ^Process @process))
+                               :attested-host-pid (atom nil)
                                :next-seq (atom 1)
                                :completed-job-ids (atom #{}))
                 request (merge {:version protocol/protocol-version
@@ -226,11 +374,13 @@
                 ready (bounded-exchange! session request startup-ms)]
             (verify-reply! session request ready #{:ready})
             (reset! (:phase session) :active)
-            (assoc session :pid (:pid ready))))
+            (assoc session :pid (:pid ready)
+                           :namespace-pid (:pid ready)
+                           :host-jvm-pid @(:attested-host-pid session))))
         (catch Throwable t
           (close-quietly! @channel)
           (close-quietly! @listener)
-          (stop-child! @process)
+          (stop-child! @process admitted?)
           (Files/deleteIfExists (.resolve socket-dir "control.sock"))
           (Files/deleteIfExists socket-dir)
           (throw t))))))
@@ -267,8 +417,8 @@
 (defn stop!
   "Request an orderly JVM shutdown and verify its exit status.
 
-  An unresponsive JVM is poisoned and forcibly terminated (DIRECT child only).
-  v1114 must not be used to claim complete process-group cleanup."
+  An unresponsive JVM poisons the session; production teardown verifies that
+  its process group has no remaining live members."
   [session]
   (locking session
     (require-valid! (= :active @(:phase session)) :session-not-active
@@ -284,6 +434,10 @@
                           :shutdown-timeout "JVM failed to terminate after shutdown")
           (require-valid! (zero? (.exitValue ^Process (:process session)))
                           :nonzero-exit "JVM exited nonzero after shutdown")
+          (when (:admitted? session)
+            (require-valid! (empty? (group-members! (:process-group session)))
+                            :termination-unverified
+                            "Production JVM group still contains live descendants"))
           (reset! (:phase session) :stopped)
           (release-transport! session)
           (cleanup-socket! session)
@@ -293,7 +447,7 @@
           (throw t))))))
 
 (defn abort!
-  "Test-only forced session teardown. Never evidence of safe group cleanup."
+  "Force a poisoned session to stop; production mode verifies group cleanup."
   [session]
   (locking session
     (when-not (= :stopped @(:phase session))
