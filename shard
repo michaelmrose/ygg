@@ -790,29 +790,147 @@
             :identity (get-in manifest [:runtimes runtime :identity])
             :session-command (get-in manifest [:runtimes runtime :session-command])})))
 
+;; Shard-owned JVM bootstrap source is NOT part of the project's Git tree.
+;; Copy exactly the two generic worker namespaces into the host-owned run
+;; basket, which Bubblewrap sees read-only through the existing --ro-bind / /.
+;; Each worker gets a unique source snapshot so neither a concurrent worker
+;; nor a later Shard checkout edit can change the code admitted to its JVM.
+(def ^:private persistent-worker-sources
+  [["shard/protocol.clj" "(ns shard.protocol"]
+   ["shard/worker/jvm.clj" "(ns shard.worker.jvm"]])
+(def ^:private persistent-worker-alias :shard.runtime/worker)
+(def ^:private source-no-follow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+
+(defn- shard-source-dir! []
+  (let [script (System/getProperty "babashka.file")]
+    (require! (and (string? script) (not (str/blank? script)))
+              "Cannot identify the installed Shard source tree")
+    (let [script-file (.getCanonicalFile (io/file script))
+          src (.toPath (io/file (.getParentFile script-file) "src"))]
+      (require! (and (.isFile script-file)
+                     (Files/isDirectory src source-no-follow))
+                "Shard source directory is missing or unsafe"
+                {:script (str script-file) :src (str src)})
+      src)))
+
+(defn- create-private-staging-dir! [^Path parent label]
+  (let [path (.resolve parent label)]
+    (try (Files/createDirectory path (make-array java.nio.file.attribute.FileAttribute 0))
+         (catch FileAlreadyExistsException _
+           (require! (Files/isDirectory path source-no-follow)
+                     "Shard runtime staging directory is unsafe" {:path (str path)})))
+    (require! (and (Files/isDirectory path source-no-follow)
+                   (not (Files/isSymbolicLink path)))
+              "Shard runtime staging directory is unsafe" {:path (str path)})
+    path))
+
+(defn- source-digest [^bytes data]
+  (let [hex (.digest (doto (MessageDigest/getInstance "SHA-256") (.update data)))]
+    (apply str (map #(format "%02x" (bit-and (int %) 0xff)) hex))))
+
+(defn- stage-persistent-worker! [^java.io.File run worker-id]
+  (let [src (shard-source-dir!)
+        root (.toPath run)
+        _ (require! (and (Files/isDirectory root source-no-follow)
+                         (re-matches id-pattern worker-id))
+                    "Invalid run directory or persistent worker identity")
+        stage (create-private-staging-dir! root "shard-persistent-runtime")
+        owned (.resolve stage worker-id)
+        _ (Files/createDirectory owned (make-array java.nio.file.attribute.FileAttribute 0))
+        dest-src (create-private-staging-dir! owned "src")
+        dest-shard (create-private-staging-dir! dest-src "shard")
+        _ (create-private-staging-dir! dest-shard "worker")
+        fingerprints
+        (into (sorted-map)
+              (for [[relative prefix] persistent-worker-sources]
+                (let [source-file (.resolve src relative)
+                      target (.resolve dest-src relative)]
+                  (require! (and (Files/isRegularFile source-file source-no-follow)
+                                 (not (Files/isSymbolicLink source-file)))
+                            "Required Shard JVM worker source is absent or unsafe"
+                            {:source (str source-file)})
+                  (let [original (Files/readAllBytes source-file)]
+                    (require! (.startsWith (str/triml (String. original "UTF-8")) prefix)
+                              "Unexpected Shard JVM worker source namespace"
+                              {:source (str source-file)})
+                    (Files/write target original
+                                 (into-array java.nio.file.OpenOption
+                                             [StandardOpenOption/CREATE_NEW
+                                              StandardOpenOption/WRITE]))
+                    ;; The sandbox already sees the run basket read-only.
+                    ;; Also withhold write permission on these exact source files.
+                    (Files/setPosixFilePermissions target
+                      (java.nio.file.attribute.PosixFilePermissions/fromString "r--r--r--"))
+                    (require! (and (= (source-digest original)
+                                      (source-digest (Files/readAllBytes target)))
+                                   (= (source-digest original)
+                                      (source-digest (Files/readAllBytes source-file))))
+                              "Persistent JVM source changed during staging"
+                              {:source (str source-file)})
+                    [relative (source-digest original)]))))]
+    {:src (str dest-src) :digests fingerprints
+     :worker-id worker-id}))
+
+(defn- admitted-clojure-command! [command staged-src project-deps]
+  ;; Only the declared Clojure CLI -M invocation is supported; do not guess
+  ;; how to inject into a different launcher or silently revert to a child.
+  (require! (and (= 4 (count command))
+                 (re-matches #"(?:.*/)?clojure" (first command))
+                 (re-matches #"-M(?::[A-Za-z0-9._/-]+)+" (second command))
+                 (= "-m" (nth command 2))
+                 (= "shard.worker.jvm" (nth command 3)))
+            "Unsupported persistent JVM entrypoint; need clojure -M:aliases -m shard.worker.jvm"
+            {:command command})
+  (require! (Files/isRegularFile project-deps source-no-follow)
+            "Persistent JVM requires a real, non-symlink project deps.edn")
+  (let [reserved (str persistent-worker-alias)
+        selected (second command)
+        deps-map (read-edn! (slurp (.toFile project-deps)) "project deps.edn")]
+    (require! (map? deps-map) "Project deps.edn must be a map")
+    (require! (or (nil? (:aliases deps-map)) (map? (:aliases deps-map)))
+              "Project deps.edn :aliases must be a map")
+    (require! (not (contains? (:aliases deps-map) persistent-worker-alias))
+              "Project deps.edn defines reserved Shard worker alias")
+    (require! (not (some #{(subs reserved 1)} (str/split selected #":")))
+              "Persistent JVM runtime selected reserved worker alias")
+    (let [overlay (pr-str {:aliases {persistent-worker-alias
+                                    {:extra-paths [staged-src]}}})]
+      [(first command) "-Sdeps" overlay (str selected ":" (subs reserved 1))
+       "-m" "shard.worker.jvm"])))
+
 (defn- start-admitted-jvm-session! [run workspace manifest runtime worker-env worker-id]
   ;; The worker process stays OUTSIDE the namespace. Only the long-lived JVM
   ;; enters this independently probed Bubblewrap environment. Its socket lives
   ;; inside the owned clone and the raw logs live outside clone destruction.
-  (let [command (get-in manifest [:runtimes runtime :session-command])
+  (let [declared-command (get-in manifest [:runtimes runtime :session-command])
         control-dir (get worker-env "XDG_RUNTIME_DIR")
         prefix (str "jvm-" worker-id)
         host-home (or (System/getenv "HOME") (System/getProperty "user.home"))]
-    (require! (string-vector? command)
+    (require! (string-vector? declared-command)
               "Persistent JVM requires declared runtime session command")
-    (jvm-session/start!
-     {:command command
-      :cwd (.getAbsolutePath ^java.io.File workspace)
-      :control-dir control-dir
-      :stdout-file (str (io/file run "logs" (str prefix ".stdout.log")))
-      :stderr-file (str (io/file run "logs" (str prefix ".stderr.log")))
-      :worker-id worker-id
-      :runtime-fingerprint (persistent-runtime-fingerprint manifest runtime)
-      :admission {:workspace (.getAbsolutePath ^java.io.File workspace)
-                  :run-dir (.getAbsolutePath ^java.io.File run)
-                  :control-dir control-dir
-                  :worker-env worker-env
-                  :host-home host-home}})))
+    (let [staged (stage-persistent-worker! run worker-id)
+          deps-file (.toPath (io/file workspace "deps.edn"))
+          command (admitted-clojure-command! declared-command (:src staged) deps-file)
+          ;; The runtime fingerprint binds the declared project configuration
+          ;; to the actual Shard worker source bytes and exact launch argv.
+          fingerprint (digest (canonical-edn
+                               {:declared (persistent-runtime-fingerprint manifest runtime)
+                                :worker-source-digests (:digests staged)
+                                :command command
+                                :project-deps-sha256 (source-digest (Files/readAllBytes deps-file))}))]
+      (jvm-session/start!
+       {:command command
+        :cwd (.getAbsolutePath ^java.io.File workspace)
+        :control-dir control-dir
+        :stdout-file (str (io/file run "logs" (str prefix ".stdout.log")))
+        :stderr-file (str (io/file run "logs" (str prefix ".stderr.log")))
+        :worker-id worker-id
+        :runtime-fingerprint fingerprint
+        :admission {:workspace (.getAbsolutePath ^java.io.File workspace)
+                    :run-dir (.getAbsolutePath ^java.io.File run)
+                    :control-dir control-dir
+                    :worker-env worker-env
+                    :host-home host-home}}))))
 
 (defn- close-owned-jvm-session! [session]
   ;; No cleanup is 'best effort': failed teardown must fail the worker and
