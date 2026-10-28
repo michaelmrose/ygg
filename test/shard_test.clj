@@ -107,10 +107,20 @@
      :shard (shard!) :bb (bb!)}))
 
 (defn- with-fixture [f]
-  (let [fx (fixture)]
-    (try (binding [*fixture-bin* (.getAbsolutePath (:bin fx))]
-           (f fx))
-         (finally (remove-tree! (:base fx))))))
+  (let [fx (fixture)
+        prior-script (System/getProperty "babashka.file")]
+    (try
+      ;; Embedded production Shard functions resolve their trusted source
+      ;; relative to babashka.file, just as the real CLI does.  Ensure the
+      ;; fixture supplies that context, then restore it for other suites.
+      (System/setProperty "babashka.file" (:shard fx))
+      (binding [*fixture-bin* (.getAbsolutePath (:bin fx))]
+        (f fx))
+      (finally
+        (if prior-script
+          (System/setProperty "babashka.file" prior-script)
+          (System/clearProperty "babashka.file"))
+        (remove-tree! (:base fx))))))
 
 (defn- invoke [fx & args]
   (exec! (:project fx) (into [(:bb fx) (:shard fx)] args) {}))
@@ -2180,7 +2190,7 @@ sys.exit(2)")
     (is (not (.isAlive thread)) "Worker thread must not leak")
     result))
 
-(deftest persistent-cli-refuses-production-session-before-claim
+(deftest persistent-cli-rejects-unsupported-entrypoint-before-claim
   (with-fixture
     (fn [fx]
       (let [command ["java" "-m" "shard.worker.jvm"]
@@ -2188,9 +2198,8 @@ sys.exit(2)")
         (enumerate-persistent! fx runtime [(persistent-job "a" "shard.test-pass-test")])
         (let [r (worker fx)]
           (is (not= 0 (:exit r)))
-          (is (or (str/includes? (:out r) "Mandatory persistent sandbox probe failed")
-                  (str/includes? (:out r) "refusing unsandboxed jobs"))
-              (str "Production admission must reject an unsafe sandbox: " (:out r)))
+          (is (str/includes? (:out r) "Unsupported persistent JVM entrypoint")
+              (str "Invalid JVM entrypoint must fail before admission: " (:out r)))
           (is (empty? (or (.listFiles (file (:run fx) "claims")) [])))
           (is (empty? (or (.listFiles (file (:run fx) "results")) []))))))))
 
@@ -2376,12 +2385,19 @@ sys.exit(2)")
                   [(str/replace filename #"\.edn$" "") (:status receipt)])
                 (results fx))))
 
+(defn- owned-persistent-runtime! [fx]
+  ;; Production staging now requires a real deps.edn and an admitted Clojure
+  ;; CLI entrypoint.  Exercise alias sanitization as well as session ownership.
+  (spit (file (:workspace fx) "deps.edn")
+        (pr-str {:aliases {:test {:main-opts ["-m" "wrong.test.main"]}}}))
+  (persistent-runtime ["clojure" "-M:test" "-m" "shard.worker.jvm"]))
+
 (deftest persistent-owned-session-admitted-before-claim-and-reused
   (with-fixture
     (fn [fx]
       (let [embedded (persistent-shard-namespace!)
             vars (owned-session-vars embedded)
-            runtime (persistent-runtime ["/deliberately-nonexistent-worker"])
+            runtime (owned-persistent-runtime! fx)
             fingerprint (persistent-fingerprint embedded runtime)
             jobs [(persistent-job "a" "shard.owned-pass-test")
                   (persistent-job "b" "shard.owned-fail-test")
@@ -2399,8 +2415,13 @@ sys.exit(2)")
              (is (= #{:command :cwd :control-dir :stdout-file :stderr-file
                       :worker-id :runtime-fingerprint :admission}
                     (set (keys opts))))
-             (is (= fingerprint (:runtime-fingerprint opts)))
-             (is (= (:session-command runtime) (:command opts)))
+             (is (re-matches #"[0-9a-f]{64}" (:runtime-fingerprint opts)))
+             (is (= ["clojure" "-Sdeps"] (subvec (:command opts) 0 2)))
+             (is (= ["-M:shard.runtime/entry-0:shard.runtime/worker"
+                     "-m" "shard.worker.jvm"]
+                    (subvec (:command opts) 3)))
+             (is (not (str/includes? (nth (:command opts) 2) "wrong.test.main"))
+                 "An alias with :main-opts must be sanitized before JVM startup")
              (is (= (.getCanonicalPath (:workspace fx)) (:cwd opts)))
              (is (= (:cwd opts) (get-in opts [:admission :workspace])))
              (is (= (.getCanonicalPath (:run fx))
@@ -2450,7 +2471,7 @@ sys.exit(2)")
             vars (owned-session-vars embedded)
             events (atom [])]
         (enumerate-persistent!
-         fx (persistent-runtime ["/invalid/jvm"])
+         fx (owned-persistent-runtime! fx)
          [(persistent-job "a" "shard.should-never-execute-test")])
         (let [error (try
                       (with-redefs-fn
@@ -2481,7 +2502,7 @@ sys.exit(2)")
             vars (owned-session-vars embedded)
             session {:phase (atom :active) :admitted? true}
             events (atom [])
-            runtime (persistent-runtime ["/invalid/per-job/fallback"])]
+            runtime (owned-persistent-runtime! fx)]
         (enumerate-persistent!
          fx runtime [(persistent-job "a" "shard.owned-first-test")
                      (persistent-job "b" "shard.owned-crash-test")
@@ -2522,7 +2543,7 @@ sys.exit(2)")
             vars (owned-session-vars embedded)
             session {:phase (atom :active) :admitted? true}
             events (atom [])]
-        (enumerate-persistent! fx (persistent-runtime ["/invalid/fallback"])
+        (enumerate-persistent! fx (owned-persistent-runtime! fx)
                                [(persistent-job "a" "shard.owned-pass-test")])
         (try
           (let [error (try
@@ -2595,7 +2616,7 @@ sys.exit(2)")
             interrupted @interrupted-var
             session {:phase (atom :active) :admitted? true}
             events (atom [])]
-        (enumerate-persistent! fx (persistent-runtime ["/invalid/fallback"])
+        (enumerate-persistent! fx (owned-persistent-runtime! fx)
                                [(persistent-job "a" "shard.interrupted-test")])
         (try
           (let [error (try
