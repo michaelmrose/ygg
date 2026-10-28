@@ -1,13 +1,22 @@
 #!/usr/bin/env bb
 ;; Shard: immutable run enumeration and filesystem-claimed workers.
-;; Persistent JVM runtime selection is staged and fail-closed until
-;; production sandbox/session admission is implemented.
+;; Persistent JVM workers use a single admitted, supervised JVM session
+;; across independently claimed namespace jobs. No subprocess fallback.
 ;; Usage: ./shard enumerate CONFIG.edn NEW-RUN-DIR
 ;;        ./shard worker RUN-DIR WORKSPACE-DIR RUNTIME [MAX-IDLE-MS] [STACK-INDEX]
 ;;        ./shard report RUN-DIR [--edn]
 ;;        ./shard gesso-inventory [GESSO-ROOT]  ; EDN on stdout
 ;;        ./shard run --workers N [--scope SCOPE]
 ;;        ./shard run --workers N --inventory COMMAND ARG ...  ; generic projects
+;; The executable runs from a project's clone, not necessarily from the Ygg
+;; repository. Resolve Shard's OWN namespaces from the executable location;
+;; never assume the project's bb.edn includes Ygg's src/ path.
+(require '[babashka.classpath :as bb-classpath])
+(when-let [source-file (System/getProperty "babashka.file")]
+  (let [home (.getParentFile (.getCanonicalFile (java.io.File. source-file)))
+        own-src (java.io.File. home "src")]
+    (when (.isDirectory own-src)
+      (bb-classpath/add-classpath (.getCanonicalPath own-src)))))
 (require '[clojure.edn :as edn]
          '[clojure.java.io :as io]
          '[clojure.java.shell :as shell]
@@ -364,6 +373,9 @@
 ;; An unrecorded crash is still an incomplete run and cannot be cleaned.
 (def ^:private active-job-process (atom nil))
 (def ^:private worker-interrupted? (atom false))
+;; The worker-level JVM is externally supervised; shutdown must abort it
+;; before the clone can be considered safe to clean.
+(def ^:private active-jvm-session (atom nil))
 (def ^:private session-format :shard/job-session)
 (def ^:private session-no-follow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
 
@@ -686,9 +698,7 @@
 ;; This adapter converts a previously CLAIMED namespace job into a command
 ;; for an already established JVM session. The runtime owns the process;
 ;; Shard owns job identity, claim arbitration, dependencies and reporting.
-;; The v1114 host session is TEST ONLY: production `shard worker` refuses any
-;; persistent runtime before its first claim until independently admitted
-;; Bubblewrap process-group sessions exist (later revision).
+;; The session must be admitted before ANY claims and owned until teardown.
 (defn- persistent-execution! [job session logfile]
   (let [started (System/nanoTime)
         namespace (get-in job [:unit :name])
@@ -697,7 +707,7 @@
     ;; A per-job receipt is not the raw JVM stdout/stderr. Long-lived worker
     ;; output is only reliably attributable at the SESSION level; later
     ;; admission work must retain raw session logs without misattributing it.
-    (spit logfile (str "Persistent JVM result (test-only session):\n"
+    (spit logfile (str "Persistent JVM session result:\n"
                        (pr-str reply) "\n"
                        "Raw stdout/stderr belong to the owning JVM session.\n"))
     (case (:type reply)
@@ -774,53 +784,92 @@
                                    claim-startup-grace-ms))))))))
           (:jobs manifest))))
 
+(defn- persistent-runtime-fingerprint [manifest runtime]
+  (digest (canonical-edn
+           {:runtime runtime
+            :identity (get-in manifest [:runtimes runtime :identity])
+            :session-command (get-in manifest [:runtimes runtime :session-command])})))
+
+(defn- start-admitted-jvm-session! [run workspace manifest runtime worker-env worker-id]
+  ;; The worker process stays OUTSIDE the namespace. Only the long-lived JVM
+  ;; enters this independently probed Bubblewrap environment. Its socket lives
+  ;; inside the owned clone and the raw logs live outside clone destruction.
+  (let [command (get-in manifest [:runtimes runtime :session-command])
+        control-dir (get worker-env "XDG_RUNTIME_DIR")
+        prefix (str "jvm-" worker-id)
+        host-home (or (System/getenv "HOME") (System/getProperty "user.home"))]
+    (require! (string-vector? command)
+              "Persistent JVM requires declared runtime session command")
+    (jvm-session/start!
+     {:command command
+      :cwd (.getAbsolutePath ^java.io.File workspace)
+      :control-dir control-dir
+      :stdout-file (str (io/file run "logs" (str prefix ".stdout.log")))
+      :stderr-file (str (io/file run "logs" (str prefix ".stderr.log")))
+      :worker-id worker-id
+      :runtime-fingerprint (persistent-runtime-fingerprint manifest runtime)
+      :admission {:workspace (.getAbsolutePath ^java.io.File workspace)
+                  :run-dir (.getAbsolutePath ^java.io.File run)
+                  :control-dir control-dir
+                  :worker-env worker-env
+                  :host-home host-home}})))
+
+(defn- close-owned-jvm-session! [session]
+  ;; No cleanup is 'best effort': failed teardown must fail the worker and
+  ;; retain the clone. An injected test session is NOT owned by worker!.
+  (if (= :active @(:phase session))
+    (jvm-session/stop! session)
+    (jvm-session/abort! session)))
+
 (defn- worker!
   ([run-path workspace-path runtime-name max-idle schedule-index]
    (worker! run-path workspace-path runtime-name max-idle schedule-index nil))
-  ([run-path workspace-path runtime-name max-idle schedule-index session]
-  (let [run (.getCanonicalFile (io/file run-path))
-        workspace (.getCanonicalFile (io/file workspace-path))
-        manifest (read-manifest! run)
-        runtime (keyword (str/replace runtime-name #"^:" ""))
-        _ (require! (contains? (:runtimes manifest) runtime)
-                    "Unknown worker runtime" {:runtime runtime})
-        _ (require! (and (.isDirectory workspace) (.canRead workspace))
-                    "Workspace must be an existing accessible directory")
-        _ (require! (and (not (.startsWith (.toPath run) (.toPath workspace)))
-                         (not (.startsWith (.toPath workspace) (.toPath run))))
-                    "Run basket must be outside the execution workspace")
-        _ (require! (and (integer? max-idle) (<= 0 max-idle 86400000))
-                    "MAX-IDLE-MS must be between 0 and 86400000")
-        ;; v1116 is the selection/accounting seam only. This test-injected
-        ;; session arity is intentionally unavailable through the public CLI.
-        ;; Production admission and group supervision are NOT established.
-        _ (case (runtime-execution manifest runtime)
-            :persistent-jvm
-            (do
-              (require! (some? session)
-                        "Persistent JVM production admission is not implemented; refusing before claim")
-              (require! (= (get-in session [:identity :runtime-fingerprint])
-                           (digest (canonical-edn
-                                    {:runtime runtime
-                                     :identity (get-in manifest [:runtimes runtime :identity])
-                                     :session-command (get-in manifest [:runtimes runtime :session-command])})))
-                        "Persistent JVM session fingerprint disagrees with declared runtime"))
-            :subprocess
-            (require! (nil? session)
-                      "Cannot inject a persistent session into subprocess runtime"))
-        _ (sandbox-preflight! workspace)
-        worker-id (str (UUID/randomUUID))
-        worker-env (create-worker-environment! workspace worker-id)
-        ;; Reject unsafe external cache paths before claiming a single job.
-        _ (read-only-cache-mounts worker-env)
-        allowed (filterv #(= runtime (:runtime %)) (:jobs manifest))
-        preferred (when schedule-index
-                    (schedule-for-worker! run manifest runtime schedule-index))
-        by-id (into {} (map (juxt :id identity) allowed))
-        matching (if preferred (mapv by-id preferred) allowed)]
-    (println "SHARD WORKER" worker-id "runtime" runtime "jobs" (count matching))
-    (flush)
-    (loop [idle-start (System/currentTimeMillis)]
+  ([run-path workspace-path runtime-name max-idle schedule-index injected-session]
+   (let [run (.getCanonicalFile (io/file run-path))
+         workspace (.getCanonicalFile (io/file workspace-path))
+         manifest (read-manifest! run)
+         runtime (keyword (str/replace runtime-name #"^:" ""))
+         _ (require! (contains? (:runtimes manifest) runtime)
+                     "Unknown worker runtime" {:runtime runtime})
+         _ (require! (and (.isDirectory workspace) (.canRead workspace))
+                     "Workspace must be an existing accessible directory")
+         _ (require! (and (not (.startsWith (.toPath run) (.toPath workspace)))
+                          (not (.startsWith (.toPath workspace) (.toPath run))))
+                     "Run basket must be outside the execution workspace")
+         _ (require! (and (integer? max-idle) (<= 0 max-idle 86400000))
+                     "MAX-IDLE-MS must be between 0 and 86400000")
+         execution (runtime-execution manifest runtime)
+         _ (case execution
+             :persistent-jvm
+             (when injected-session
+               (require! (= (get-in injected-session [:identity :runtime-fingerprint])
+                            (persistent-runtime-fingerprint manifest runtime))
+                         "Persistent JVM session fingerprint disagrees with declared runtime"))
+             :subprocess
+             (require! (nil? injected-session)
+                       "Cannot inject persistent session into subprocess runtime"))
+         _ (sandbox-preflight! workspace)
+         worker-id (str (UUID/randomUUID))
+         worker-env (create-worker-environment! workspace worker-id)
+         ;; Reject unsafe host cache mounts before any claim or session launch.
+         _ (read-only-cache-mounts worker-env)
+         allowed (filterv #(= runtime (:runtime %)) (:jobs manifest))
+         preferred (when schedule-index
+                     (schedule-for-worker! run manifest runtime schedule-index))
+         by-id (into {} (map (juxt :id identity) allowed))
+         matching (if preferred (mapv by-id preferred) allowed)
+         owned? (and (= :persistent-jvm execution) (nil? injected-session))
+         session (if owned?
+                   (start-admitted-jvm-session! run workspace manifest runtime
+                                                worker-env worker-id)
+                   injected-session)]
+     ;; A successful handshake and positive native admission MUST precede
+     ;; the first atomic claim. The test-injection arity never reaches CLI.
+     (when owned? (reset! active-jvm-session session))
+     (try
+        (println "SHARD WORKER" worker-id "runtime" runtime "jobs" (count matching))
+        (flush)
+        (loop [idle-start (System/currentTimeMillis)]
       (let [results (read-results! run manifest)
             outstanding (filterv #(not (contains? results (:id %))) matching)
             unclaimed (filterv #(not (.exists (io/file run "claims" (:id %))))
@@ -866,8 +915,13 @@
           (do (println "SHARD WORKER IDLE" worker-id
                        "unresolved" (count outstanding)
                        "unclaimed" (count unclaimed))
-              (flush))))))))
-
+              (flush)))))
+       (finally
+         (when owned?
+           ;; Retain the handle if teardown fails. An interruption hook can
+           ;; then retry the abort; never discard an unsafe live session.
+           (close-owned-jvm-session! session)
+           (reset! active-jvm-session nil)))))))
 ;; Reporting reads only completed, immutable results. It never claims jobs,
 ;; releases claims, retries work, or mutates an active run.
 (def ^:private result-keys
@@ -1833,6 +1887,10 @@
             #(worker! run-dir workspace runtime idle-ms stack-index)
             (fn []
               (reset! worker-interrupted? true)
+              (when-let [session @active-jvm-session]
+                (binding [*out* *err*]
+                  (println "SHARD WORKER INTERRUPTED; aborting admitted JVM session"))
+                (jvm-session/abort! session))
               (when-let [^Process p @active-job-process]
                 (binding [*out* *err*]
                   (println "SHARD WORKER INTERRUPTED; terminating test session"
