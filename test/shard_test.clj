@@ -17,6 +17,37 @@
 (def ^:private attrs (make-array FileAttribute 0))
 (def ^:private no-follow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
 
+;; v1108: A namespace-capable test double is installed in every disposable
+;; fixture, rather than implicitly depending on a host bwrap installation.
+;; This launcher creates actual Linux user/net/PID/mount namespaces and
+;; brings up private loopback; it does NOT claim Bubblewrap's read-only host
+;; mount semantics. Native mount/Playwright acceptance remains separate.
+;; The production Shard executable is never modified or bypassed.
+(def ^:dynamic *fixture-bin* nil)
+
+(def ^:private scratch-namespace-bwrap-shim
+  (str "#!/usr/bin/env python3\n"
+       "import os, sys, subprocess\n"
+       "argv=sys.argv[1:]\n"
+       "if '--' not in argv: sys.exit(91)\n"
+       "for flag in ('--unshare-user','--unshare-net','--unshare-pid',\n"
+       "             '--unshare-ipc','--ro-bind','--bind','--proc','--dev'):\n"
+       "    if flag not in argv: sys.exit(92)\n"
+       "command=argv[argv.index('--')+1:]\n"
+       "if not command: sys.exit(93)\n"
+       "inner = '''import os,sys,subprocess\n"
+       "subprocess.run(['ip','link','set','lo','up'],check=True)\n"
+       "target=os.environ.get('SHARD_TEST_SCRATCH_READONLY','')\n"
+       "if target:\n"
+       "    if target not in ('/tmp','/dev/shm'): sys.exit(94)\n"
+       "    subprocess.run(['mount','--bind',target,target],check=True)\n"
+       "    subprocess.run(['mount','-o','remount,bind,ro',target],check=True)\n"
+       "os.execvp(sys.argv[1],sys.argv[1:])\n"
+       "'''\n"
+       "command=['unshare','--user','--map-root-user','--net','--pid',\n"
+       "         '--mount','--fork','python3','-c',inner]+command\n"
+       "os.execvp(command[0],command)\n"))
+
 (defn- file [& xs] (apply io/file xs))
 (defn- exists? [f] (Files/exists (.toPath (io/file f)) no-follow))
 (defn- remove-tree! [root]
@@ -44,6 +75,10 @@
     (.directory builder (io/file cwd))
     (.redirectErrorStream builder true)
     (.redirectOutput builder (ProcessBuilder$Redirect/to (.toFile log)))
+    (when *fixture-bin*
+      (.put (.environment builder) "PATH"
+            (str *fixture-bin* java.io.File/pathSeparator
+                 (System/getenv "PATH"))))
     (doseq [[key value] env]
       (.put (.environment builder) (name key) (str value)))
     (try
@@ -63,12 +98,18 @@
         bin (file base "bin")
         run (file base "run")]
     (doseq [d [project workspace bin]] (.mkdirs d))
+    (let [launcher (file bin "bwrap")]
+      (spit launcher scratch-namespace-bwrap-shim)
+      (when-not (.setExecutable launcher true)
+        (throw (ex-info "Cannot install namespace-capable test launcher"
+                        {:path (str launcher)}))))
     {:base base :project project :workspace workspace :bin bin :run run
      :shard (shard!) :bb (bb!)}))
 
 (defn- with-fixture [f]
   (let [fx (fixture)]
-    (try (f fx)
+    (try (binding [*fixture-bin* (.getAbsolutePath (:bin fx))]
+           (f fx))
          (finally (remove-tree! (:base fx))))))
 
 (defn- invoke [fx & args]
@@ -536,6 +577,10 @@ else:
     (.directory builder (io/file cwd))
     (.redirectErrorStream builder true)
     (.redirectOutput builder (ProcessBuilder$Redirect/to out))
+    (when *fixture-bin*
+      (.put (.environment builder) "PATH"
+            (str *fixture-bin* java.io.File/pathSeparator
+                 (System/getenv "PATH"))))
     (doseq [[key value] env]
       (.put (.environment builder) (name key) (str value)))
     {:process (.start builder) :log out}))
@@ -1246,15 +1291,6 @@ sys.exit(2)")
   {"PATH" (str (.getAbsolutePath (:bin fx)) java.io.File/pathSeparator
                (System/getenv "PATH"))})
 
-(defn- bwrap-on-test-path []
-  (some (fn [directory]
-          (let [candidate (file directory "bwrap")]
-            (when (and (.isFile candidate) (.canExecute candidate))
-              (.getAbsolutePath candidate))))
-        (str/split (or (System/getenv "PATH") "")
-                   (re-pattern (java.util.regex.Pattern/quote
-                                 java.io.File/pathSeparator)))))
-
 (def ^:private fake-bwrap-without-namespaces
   "#!/bin/sh\n# Mimic argument handling but refuse no namespace flags: the real\n# Shard sandbox-probe must reject an unsandboxed subprocess.\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = '--' ]; then shift; exec \"$@\"; fi\n  shift\ndone\nexit 98\n")
 
@@ -1263,8 +1299,9 @@ sys.exit(2)")
     (with-fixture
       (fn [fx]
         (enumerate! fx [(job "untouched" ["bash" "-c" "touch UNSANDBOXED"])])
-        (when (= kind :noop)
-          (sandbox-script! fx "bwrap" fake-bwrap-without-namespaces))
+        (if (= kind :noop)
+          (sandbox-script! fx "bwrap" fake-bwrap-without-namespaces)
+          (Files/deleteIfExists (.toPath (file (:bin fx) "bwrap"))))
         (let [path (.getAbsolutePath (:bin fx))
               outcome (exec! (:project fx)
                              [(resolved-test-bb! fx) (:shard fx) "worker"
@@ -1297,10 +1334,13 @@ sys.exit(2)")
 (deftest sandbox-arguments-are-required-for-preflight-and-every-claimed-job
   (with-fixture
     (fn [fx]
-      (let [actual (bwrap-on-test-path)
+      (let [actual (.getAbsolutePath (file (:bin fx) "bwrap-base"))
             audit (file (:base fx) "bwrap-audit.log")]
-        (is (some? actual) "This test requires bwrap or a namespace-capable test shim")
-        (when actual
+        ;; Delegate to a separate, already verified namespace-capable launcher;
+        ;; instrumenting bwrap in place must never recurse into itself.
+        (spit actual scratch-namespace-bwrap-shim)
+        (is (.setExecutable (file actual) true))
+        (when (is (.canExecute (file actual)))
           (let [escaped (str/replace (.getAbsolutePath audit) "'" "'\\''")
                 launcher (str "#!/bin/sh\nprintf '%s\\n' BEGIN \"$@\" END >> '"
                               escaped "'\nexec '"
@@ -1411,15 +1451,27 @@ sys.exit(2)")
           (is (empty? (or (.listFiles (file (:run fx) "claims")) [])))
           (is (not (exists? (file redirection "never")))))))))
 
+(defn- native-bwrap-path []
+  ;; SHARD_TEST_NATIVE_BWRAP permits a supplied executable to be checked
+  ;; explicitly, without accidentally accepting our test-only shim.
+  (let [override (some-> (System/getenv "SHARD_TEST_NATIVE_BWRAP")
+                         str/trim not-empty)
+        candidates (if override [override] ["/usr/bin/bwrap" "/bin/bwrap"])]
+    (some (fn [candidate]
+            (let [f (file candidate)]
+              (when (and (.isFile f) (.canExecute f))
+                (.getCanonicalPath f))))
+          candidates)))
+
 (deftest native-bubblewrap-host-mount-is-readonly-while-workspace-is-writable
   ;; A test-only unshare shim cannot simulate ro-bind. Execute this test ONLY
   ;; against a native bwrap executable; it becomes mandatory automatically
   ;; whenever bwrap is installed in a standard system location.
-  (let [native (some (fn [p] (when (and (.isFile (file p))
-                                         (.canExecute (file p))) p))
-                     ["/usr/bin/bwrap" "/bin/bwrap"])]
+  (let [native (native-bwrap-path)]
     (if (nil? native)
-      (println "SKIP native Bubblewrap read-only mount test: bwrap not installed")
+      (if (= "1" (System/getenv "SHARD_TEST_REQUIRE_BWRAP"))
+        (is false "Required native Bubblewrap is unavailable")
+        (println "SKIP native Bubblewrap read-only mount test: bwrap not installed"))
       (with-fixture
         (fn [fx]
           (let [outside (file (:base fx) "outside")]
@@ -1765,12 +1817,6 @@ sys.exit(2)")
 ;; Without SHARD_TEST_GESSO_ROOT this test is explicitly skipped. With the
 ;; variable set any missing native bwrap, failing Playwright/Chromium, failure
 ;; to create clones, or incomplete job MUST fail; no shim or --dump-dom fallback.
-(defn- native-bwrap-path []
-  (some (fn [candidate]
-          (let [f (file candidate)]
-            (when (and (.isFile f) (.canExecute f))
-              (.getCanonicalPath f))))
-        ["/usr/bin/bwrap" "/bin/bwrap"]))
 
 (defn- checked-test-command! [root args env max-ms]
   (let [r (exec! root args env max-ms)]
@@ -1915,35 +1961,9 @@ sys.exit(2)")
                               (str "Real Gesso Playwright integration not proven: " id)))))))))))))))
 
 
-;; v1107 — Browser scratch admission is a testable, fail-closed contract.
-;; We cannot assume bwrap is installed on every regression host.  This
-;; namespace-capable test-only launcher runs the REAL v1106 sandbox probe in
-;; new Linux user/net/PID/mount namespaces.  For refusal cases, it remounts a
-;; real /tmp or /dev/shm mount read-only in that child namespace.  This does
-;; not imitate or certify Bubblewrap's host read-only mount policy; see the
-;; separate native Bubblewrap regression above for that proof obligation.
-(def ^:private scratch-namespace-bwrap-shim
-  (str "#!/usr/bin/env python3\n"
-       "import os, sys, subprocess\n"
-       "argv=sys.argv[1:]\n"
-       "if '--' not in argv: sys.exit(91)\n"
-       "for flag in ('--unshare-user','--unshare-net','--unshare-pid',\n"
-       "             '--unshare-ipc','--ro-bind','--bind','--proc','--dev'):\n"
-       "    if flag not in argv: sys.exit(92)\n"
-       "command=argv[argv.index('--')+1:]\n"
-       "if not command: sys.exit(93)\n"
-       "inner = '''import os,sys,subprocess\n"
-       "subprocess.run(['ip','link','set','lo','up'],check=True)\n"
-       "target=os.environ.get('SHARD_TEST_SCRATCH_READONLY','')\n"
-       "if target:\n"
-       "    if target not in ('/tmp','/dev/shm'): sys.exit(94)\n"
-       "    subprocess.run(['mount','--bind',target,target],check=True)\n"
-       "    subprocess.run(['mount','-o','remount,bind,ro',target],check=True)\n"
-       "os.execvp(sys.argv[1],sys.argv[1:])\n"
-       "'''\n"
-       "command=['unshare','--user','--map-root-user','--net','--pid',\n"
-       "         '--mount','--fork','python3','-c',inner]+command\n"
-       "os.execvp(command[0],command)\n"))
+;; v1107 scratch-path admission regression: use the shared v1108
+;; namespace launcher, with a real read-only remount for refusal cases.
+;; Native Bubblewrap mount policy is checked separately above.
 
 (defn- namespace-scratch-shim! [fx]
   (sandbox-script! fx "bwrap" scratch-namespace-bwrap-shim)
