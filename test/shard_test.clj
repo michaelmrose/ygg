@@ -2071,8 +2071,8 @@ sys.exit(2)")
         (is (empty? (or (.listFiles (file (:run fx) "results")) [])))
         (is (not (exists? (file (:workspace fx) "scratch-job-ran"))))))))
 
-;; v1117: Persistent sessions are deliberately *test-injected*, not admitted
-;; by the production CLI.  This section exercises the real v1116 Shard claim
+;; v1117: These claim-loop tests deliberately inject sessions; v1121
+;; separately attempts native production admission in the CLI.  This section exercises the real v1116 Shard claim
 ;; loop, on-disk inventory/claims/results and two actual JVM processes.  Only
 ;; the sandbox preflight is replaced by a test-only no-op: the v1114 session
 ;; launcher cannot prove Bubblewrap/process-group admission.  Those remain
@@ -2188,8 +2188,9 @@ sys.exit(2)")
         (enumerate-persistent! fx runtime [(persistent-job "a" "shard.test-pass-test")])
         (let [r (worker fx)]
           (is (not= 0 (:exit r)))
-          (is (str/includes? (:out r) "production admission is not implemented")
-              (:out r))
+          (is (or (str/includes? (:out r) "Mandatory persistent sandbox probe failed")
+                  (str/includes? (:out r) "refusing unsandboxed jobs"))
+              (str "Production admission must reject an unsafe sandbox: " (:out r)))
           (is (empty? (or (.listFiles (file (:run fx) "claims")) [])))
           (is (empty? (or (.listFiles (file (:run fx) "results")) []))))))))
 
@@ -2345,6 +2346,286 @@ sys.exit(2)")
                 (when @s ((requiring-resolve 'shard.runtime.jvm-session/abort!) @s)))))))
       require-native? (is false "SHARD_TEST_JVM_CLASSPATH missing for mandatory JVM timeout test")
       :else (println "SKIP persistent-jvm-lost-session-keeps-claim-incomplete: set SHARD_TEST_JVM_CLASSPATH"))))
+
+
+
+;; v1122: verify the *owned* production lifecycle, not just injection via the
+;; six-argument worker! fixture.  Only the external JVM session interface and
+;; Linux sandbox preflight are replaced in these tests.  Inventory publication,
+;; worker initialization, runtime validation, atomic claims, execution routing,
+;; dependency policy, receipts and report reconciliation run unchanged.
+;; These tests do NOT assert native Bubblewrap admission; the opt-in native
+;; acceptance gate is in shard.runtime-admission-test.
+(defn- owned-session-vars [embedded]
+  (let [vars {:start (requiring-resolve 'shard.runtime.jvm-session/start!)
+              :run (requiring-resolve 'shard.runtime.jvm-session/run!)
+              :stop (requiring-resolve 'shard.runtime.jvm-session/stop!)
+              :abort (requiring-resolve 'shard.runtime.jvm-session/abort!)
+              :active (ns-resolve (-> (:worker embedded) meta :ns)
+                                  'active-jvm-session)}]
+    (when-not (every? some? (vals vars))
+      (throw (ex-info "Production JVM lifecycle fixture seam changed" {})))
+    vars))
+
+(defn- claimed-ids [fx]
+  (set (map #(.getName ^java.io.File %)
+            (or (.listFiles (file (:run fx) "claims")) []))))
+
+(defn- recorded-statuses [fx]
+  (into {} (map (fn [[filename receipt]]
+                  [(str/replace filename #"\.edn$" "") (:status receipt)])
+                (results fx))))
+
+(deftest persistent-owned-session-admitted-before-claim-and-reused
+  (with-fixture
+    (fn [fx]
+      (let [embedded (persistent-shard-namespace!)
+            vars (owned-session-vars embedded)
+            runtime (persistent-runtime ["/deliberately-nonexistent-worker"])
+            fingerprint (persistent-fingerprint embedded runtime)
+            jobs [(persistent-job "a" "shard.owned-pass-test")
+                  (persistent-job "b" "shard.owned-fail-test")
+                  (persistent-job "c" "shard.owned-blocked-test" ["b"] 10000)
+                  (persistent-job "d" "shard.owned-after-failure-test")]
+            events (atom [])
+            session {:identity {:runtime-fingerprint fingerprint}
+                     :phase (atom :active)
+                     :admitted? true}]
+        (enumerate-persistent! fx runtime jobs)
+        (with-redefs-fn
+          {(:preflight embedded) (fn [_] (swap! events conj :preflight))
+           (:start vars)
+           (fn [opts]
+             (is (= #{:command :cwd :control-dir :stdout-file :stderr-file
+                      :worker-id :runtime-fingerprint :admission}
+                    (set (keys opts))))
+             (is (= fingerprint (:runtime-fingerprint opts)))
+             (is (= (:session-command runtime) (:command opts)))
+             (is (= (.getCanonicalPath (:workspace fx)) (:cwd opts)))
+             (is (= (:cwd opts) (get-in opts [:admission :workspace])))
+             (is (= (.getCanonicalPath (:run fx))
+                    (get-in opts [:admission :run-dir])))
+             (is (str/starts-with? (:control-dir opts)
+                                   (.getCanonicalPath (:workspace fx))))
+             (is (str/starts-with? (:stdout-file opts)
+                                   (.getCanonicalPath (:run fx))))
+             (is (= #{} (claimed-ids fx))
+                 "Native admission and handshake must finish before first claim")
+             (swap! events conj :start)
+             session)
+           (:run vars)
+           (fn [s id namespace timeout]
+             (is (identical? session s))
+             (is (pos? timeout))
+             (swap! events conj [:run id namespace])
+             {:type :result :status (if (= "b" id) :failed :passed)
+              :job-id id})
+           (:stop vars)
+           (fn [s]
+             (is (identical? session s))
+             (swap! events conj :stop)
+             (reset! (:phase s) :stopped))
+           (:abort vars)
+           (fn [_] (swap! events conj :unexpected-abort))}
+          (fn []
+            ((:worker embedded) (str (:run fx)) (str (:workspace fx)) "jvm" 1000 nil)))
+        (is (= [:preflight :start
+                [:run "a" "shard.owned-pass-test"]
+                [:run "b" "shard.owned-fail-test"]
+                [:run "d" "shard.owned-after-failure-test"]
+                :stop]
+               @events)
+            "One admitted session must run multiple claimed jobs, then shut down once")
+        (is (= {"a" :passed "b" :failed "c" :blocked "d" :passed}
+               (recorded-statuses fx)))
+        (is (= #{"a" "b" "c" "d"} (claimed-ids fx)))
+        (is (= :fail (get-in (report fx) [:edn :overall])))
+        (is (= :stopped @(:phase session)))
+        (is (nil? @@(:active vars)))))))
+
+(deftest persistent-owned-session-refuses-admission-before-any-claim
+  (with-fixture
+    (fn [fx]
+      (let [embedded (persistent-shard-namespace!)
+            vars (owned-session-vars embedded)
+            events (atom [])]
+        (enumerate-persistent!
+         fx (persistent-runtime ["/invalid/jvm"])
+         [(persistent-job "a" "shard.should-never-execute-test")])
+        (let [error (try
+                      (with-redefs-fn
+                        {(:preflight embedded) (fn [_] (swap! events conj :preflight))
+                         (:start vars) (fn [_]
+                                         (swap! events conj :admission-refused)
+                                         (throw (ex-info "Native Bubblewrap probe refused"
+                                                         {:reason :admission})))
+                         (:run vars) (fn [& _] (swap! events conj :unexpected-run))
+                         (:stop vars) (fn [& _] (swap! events conj :unexpected-stop))
+                         (:abort vars) (fn [& _] (swap! events conj :unexpected-abort))}
+                        (fn []
+                          ((:worker embedded) (str (:run fx))
+                           (str (:workspace fx)) "jvm" 0 nil)
+                          nil))
+                      (catch clojure.lang.ExceptionInfo e e))]
+          (is (instance? clojure.lang.ExceptionInfo error))
+          (is (= :admission (:reason (ex-data error))))
+          (is (= [:preflight :admission-refused] @events))
+          (is (empty? (claimed-ids fx)))
+          (is (empty? (results fx)))
+          (is (= :incomplete (get-in (report fx) [:edn :overall]))))))))
+
+(deftest persistent-owned-session-failure-poisons-and-retains-incomplete-claim
+  (with-fixture
+    (fn [fx]
+      (let [embedded (persistent-shard-namespace!)
+            vars (owned-session-vars embedded)
+            session {:phase (atom :active) :admitted? true}
+            events (atom [])
+            runtime (persistent-runtime ["/invalid/per-job/fallback"])]
+        (enumerate-persistent!
+         fx runtime [(persistent-job "a" "shard.owned-first-test")
+                     (persistent-job "b" "shard.owned-crash-test")
+                     (persistent-job "c" "shard.owned-never-test")])
+        (let [error (try
+                      (with-redefs-fn
+                        {(:preflight embedded) (fn [_] true)
+                         (:start vars) (fn [_] (swap! events conj :start) session)
+                         (:run vars) (fn [_ id _ _]
+                                       (swap! events conj [:run id])
+                                       (if (= "b" id)
+                                         (do (reset! (:phase session) :poisoned)
+                                             (throw (ex-info "JVM control socket lost"
+                                                             {:reason :session-lost})))
+                                         {:type :result :status :passed}))
+                         (:stop vars) (fn [& _] (swap! events conj :unexpected-stop))
+                         (:abort vars) (fn [s]
+                                         (swap! events conj :abort)
+                                         (is (identical? session s)))}
+                        (fn []
+                          ((:worker embedded) (str (:run fx))
+                           (str (:workspace fx)) "jvm" 0 nil)
+                          nil))
+                      (catch clojure.lang.ExceptionInfo e e))]
+          (is (instance? clojure.lang.ExceptionInfo error))
+          (is (= :session-lost (:reason (ex-data error))))
+          (is (= [:start [:run "a"] [:run "b"] :abort] @events))
+          (is (= #{"a" "b"} (claimed-ids fx)))
+          (is (= {"a" :passed} (recorded-statuses fx))
+              "Never publish invented receipts after transport failure")
+          (is (= :incomplete (get-in (report fx) [:edn :overall])))
+          (is (nil? @@(:active vars))))))))
+
+(deftest persistent-owned-session-unverified-teardown-retains-handle
+  (with-fixture
+    (fn [fx]
+      (let [embedded (persistent-shard-namespace!)
+            vars (owned-session-vars embedded)
+            session {:phase (atom :active) :admitted? true}
+            events (atom [])]
+        (enumerate-persistent! fx (persistent-runtime ["/invalid/fallback"])
+                               [(persistent-job "a" "shard.owned-pass-test")])
+        (try
+          (let [error (try
+                        (with-redefs-fn
+                          {(:preflight embedded) (fn [_] true)
+                           (:start vars) (fn [_] (swap! events conj :start) session)
+                           (:run vars) (fn [& _]
+                                         (swap! events conj :run)
+                                         {:type :result :status :passed})
+                           (:stop vars) (fn [_]
+                                          (swap! events conj :stop)
+                                          (throw (ex-info "Descendants still live"
+                                                          {:reason :termination-unverified})))
+                           (:abort vars) (fn [& _]
+                                           (swap! events conj :unexpected-abort))}
+                          (fn []
+                            ((:worker embedded) (str (:run fx))
+                             (str (:workspace fx)) "jvm" 0 nil)
+                            nil))
+                        (catch clojure.lang.ExceptionInfo e e))]
+            (is (instance? clojure.lang.ExceptionInfo error))
+            (is (= :termination-unverified (:reason (ex-data error))))
+            (is (= [:start :run :stop] @events))
+            (is (identical? session @@(:active vars))
+                "Unverified process teardown must retain the active session for the interruption hook")
+            (is (= {"a" :passed} (recorded-statuses fx)))
+            (is (= :active @(:phase session))))
+          (finally
+            ;; The fixture has no actual JVM process. Never leave this fake
+            ;; global interrupt state behind for another test.
+            (reset! @(:active vars) nil)))))))
+
+(deftest persistent-owned-session-refuses-bad-runtime-fingerprint-before-claim
+  (with-fixture
+    (fn [fx]
+      (let [embedded (persistent-shard-namespace!)
+            vars (owned-session-vars embedded)
+            events (atom [])
+            wrong-session {:identity {:runtime-fingerprint (apply str (repeat 64 "0"))}
+                           :phase (atom :active)}]
+        (enumerate-persistent! fx (persistent-runtime ["/bad/command"])
+                               [(persistent-job "a" "shard.should-never-run-test")])
+        (let [error (try
+                      (with-redefs-fn
+                        {(:preflight embedded) (fn [& _] (swap! events conj :preflight))
+                         (:start vars) (fn [& _] (swap! events conj :unexpected-start))
+                         (:run vars) (fn [& _] (swap! events conj :unexpected-run))}
+                        (fn []
+                          ((:worker embedded) (str (:run fx)) (str (:workspace fx))
+                           "jvm" 0 nil wrong-session)
+                          nil))
+                      (catch clojure.lang.ExceptionInfo e e))]
+          (is (instance? clojure.lang.ExceptionInfo error))
+          (is (str/includes? (.getMessage error) "fingerprint"))
+          (is (empty? @events))
+          (is (empty? (claimed-ids fx)))
+          (is (empty? (results fx))))))))
+
+
+
+(deftest persistent-owned-session-interruption-retains-unreported-claim
+  (with-fixture
+    (fn [fx]
+      (let [embedded (persistent-shard-namespace!)
+            vars (owned-session-vars embedded)
+            interrupted-var (ns-resolve (-> (:worker embedded) meta :ns)
+                                        'worker-interrupted?)
+            _ (when-not interrupted-var
+                (throw (ex-info "Worker interruption fixture seam changed" {})))
+            interrupted @interrupted-var
+            session {:phase (atom :active) :admitted? true}
+            events (atom [])]
+        (enumerate-persistent! fx (persistent-runtime ["/invalid/fallback"])
+                               [(persistent-job "a" "shard.interrupted-test")])
+        (try
+          (let [error (try
+                        (with-redefs-fn
+                          {(:preflight embedded) (fn [_] true)
+                           (:start vars) (fn [_] (swap! events conj :start) session)
+                           (:run vars) (fn [_ _ _ _]
+                                         (swap! events conj :run)
+                                         ;; Simulate the worker's interruption
+                                         ;; handler invalidating this session while
+                                         ;; a namespace is executing.
+                                         (reset! interrupted true)
+                                         (reset! (:phase session) :poisoned)
+                                         {:type :result :status :passed})
+                           (:stop vars) (fn [& _] (swap! events conj :unexpected-stop))
+                           (:abort vars) (fn [_] (swap! events conj :abort))}
+                          (fn []
+                            ((:worker embedded) (str (:run fx))
+                             (str (:workspace fx)) "jvm" 0 nil)
+                            nil))
+                        (catch clojure.lang.ExceptionInfo e e))]
+            (is (instance? clojure.lang.ExceptionInfo error))
+            (is (str/includes? (.getMessage error) "interrupted"))
+            (is (= [:start :run :abort] @events))
+            (is (= #{"a"} (claimed-ids fx)))
+            (is (empty? (results fx))
+                "An interrupted successful command MUST NOT publish success")
+            (is (= :incomplete (get-in (report fx) [:edn :overall]))))
+          (finally
+            (reset! interrupted false)))))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
