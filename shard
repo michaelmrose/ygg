@@ -1098,6 +1098,11 @@
               "Unexpected or unsafe run artifact"
               {:path (str f) :expected (if directory? :directory :regular-file)})))
 
+(def ^:private persistent-session-log-pattern
+  ;; The admitted persistent JVM writes raw process output once per worker,
+  ;; outside the clone. These are NOT job logs or immutable job receipts.
+  #"jvm-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(stdout|stderr)\.log")
+
 (defn- scan-artifacts! [run job-ids]
   (let [claims (safe-entries! (io/file run "claims"))
         results (safe-entries! (io/file run "results"))
@@ -1107,7 +1112,8 @@
       (require! (contains? job-ids (.getName f))
                 "Unexpected job-claim entry" {:path (str f)})
       (check-artifact! f true))
-    (let [temporary (atom [])]
+    (let [temporary (atom [])
+          session-logs (atom [])]
       (doseq [f results]
         (let [n (.getName f)
               id (when (str/ends-with? n ".edn") (subs n 0 (- (count n) 4)))
@@ -1123,11 +1129,19 @@
             :else (fail! "Unexpected job-result entry" {:path (str f)}))))
       (doseq [f logs]
         (let [n (.getName f)
-              id (when (str/ends-with? n ".log") (subs n 0 (- (count n) 4)))]
-          (require! (contains? job-ids id) "Unexpected job-log entry" {:path (str f)})
-          (check-artifact! f false)))
+              id (when (str/ends-with? n ".log") (subs n 0 (- (count n) 4)))
+              session-match (re-matches persistent-session-log-pattern n)]
+          (require! (or (contains? job-ids id) session-match)
+                    "Unexpected job-log entry" {:path (str f)})
+          ;; No symlink, directory or fabricated artifact type may bypass
+          ;; verification through the new session-log allowance.
+          (check-artifact! f false)
+          (when session-match
+            (swap! session-logs conj {:worker-id (second session-match)
+                                      :name n}))))
       {:claims (set (map #(.getName ^java.io.File %) claims))
        :logs (set (map #(.getName ^java.io.File %) logs))
+       :session-logs (vec @session-logs)
        :unpublished (vec (sort @temporary))})))
 
 (defn- parse-instant! [text field id]
@@ -1286,6 +1300,22 @@
         results (read-results! run manifest)]
     (doseq [[id result] results]
       (validate-result! by-id results artifacts id result))
+    ;; Once the inventory is complete, every process-wide JVM diagnostic
+    ;; must belong to an admitted persistent-runtime worker represented by
+    ;; a real job receipt. An arbitrary jvm-UUID log cannot make a complete
+    ;; run green. During an incomplete run, startup failures may legitimately
+    ;; leave session logs without any finished job; keep it reportable as
+    ;; :incomplete rather than rejecting its useful diagnostics.
+    (when (= (count jobs) (count results))
+      (let [persistent-workers
+            (set (for [[id result] results
+                       :when (= :persistent-jvm
+                                (runtime-execution manifest (:runtime (by-id id))))]
+                   (:worker-id result)))]
+        (doseq [{:keys [worker-id name]} (:session-logs artifacts)]
+          (require! (contains? persistent-workers worker-id)
+                    "JVM session log has no matching persistent worker receipt"
+                    {:file name :worker-id worker-id}))))
     (let [entries (mapv (fn [{:keys [id gate runtime depends-on]}]
                           (let [result (get results id)
                                 status (if result
