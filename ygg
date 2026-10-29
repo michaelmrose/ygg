@@ -3,6 +3,7 @@
 ;; Usage: ygg [-n N] create | status [--edn] | clean
 ;;        ygg tail [--workers|--stderr|--all] [--run PATH] [--once]
 ;;        ygg report [--edn] [--run PATH]
+;;        ygg explain [--run PATH]
 ;;        ygg jobs [--all] [--sort duration|error] [--run PATH]
 ;;        ygg report --timeline [--run PATH] | ygg timeline [--run PATH]
 ;; Clone mountpoints: REPO/.ygg/workers/1 ... N; run results: REPO/.ygg/runs/.
@@ -490,6 +491,15 @@
 ;; Job ranking is an observational view of Shard's validated receipt data.
 ;; Incomplete and failed reports exit 1 by design, but still contain valid EDN.
 ;; Never derive success from the exit code alone or read unvalidated receipts.
+(defn- explain! [root {:keys [run]}]
+  (let [selected (tail-run! root run)
+        process (.start (doto (ProcessBuilder. ^java.util.List
+                                               ["shard" "explain" (str selected)])
+                          (.inheritIO)))
+        exit (.waitFor process)]
+    (when-not (zero? exit)
+      (System/exit exit))))
+
 (defn- jobs-report! [run]
   (let [{:keys [exit out err]} (shell/sh "shard" "report" (str run) "--edn")
         report (try (edn/read-string {:readers {} :default (fn [_ _] ::untrusted)}
@@ -731,7 +741,7 @@
           (= "--edn" x)
           (do (when (:edn? parsed) (fail! "Duplicate --edn"))
               (recur (next xs) (assoc parsed :edn? true)))
-          (#{"create" "clean" "status" "tail" "report" "jobs" "timeline"} x)
+          (#{"create" "clean" "status" "tail" "report" "explain" "jobs" "timeline"} x)
           (do (when (:action parsed) (fail! "Multiple actions"))
               (recur (next xs) (assoc parsed :action (keyword x))))
           (str/starts-with? x "-") (fail! (str "Unrecognized option: " x))
@@ -777,8 +787,8 @@
         action (or (:action cli) (:action config))
         n (or (:n cli) (:n config) 1)]
     (when-not (.isDirectory (io/file root)) (fail! "Not a directory"))
-    (when-not (#{:create :clean :status :tail :report :jobs :timeline} action)
-      (fail! "Specify create, clean, status, tail, report, jobs, timeline or :action in ygg.edn"))
+    (when-not (#{:create :clean :status :tail :report :explain :jobs :timeline} action)
+      (fail! "Specify create, clean, status, tail, report, explain, jobs, timeline or :action in ygg.edn"))
     (when-not (and (integer? n) (<= 1 n 256))
       (fail! "Clone count must be 1..256"))
     (when (and (:edn? cli) (:timeline? cli))
@@ -793,14 +803,15 @@
       (fail! "--once is supported only for tail"))
     (when (and (not= action :jobs) (or (:all? cli) (:sort cli)))
       (fail! "--all and --sort are supported only for jobs"))
-    (when (and (not (#{:tail :report :jobs :timeline} action)) (:run cli))
-      (fail! "--run is supported only for tail, report, jobs and timeline"))
-    (when (and (#{:tail :report :jobs :timeline} action) (:n cli))
-      (fail! "-n is not supported for tail, report, jobs or timeline"))
+    (when (and (not (#{:tail :report :explain :jobs :timeline} action)) (:run cli))
+      (fail! "--run is supported only for tail, report, explain, jobs and timeline"))
+    (when (and (#{:tail :report :explain :jobs :timeline} action) (:n cli))
+      (fail! "-n is not supported for tail, report, explain, jobs or timeline"))
     (case action
       :tail (tail! root cli)
       :report (if (:timeline? cli) (timeline! root cli) (report! root cli))
       :timeline (timeline! root cli)
+      :explain (explain! root cli)
       :jobs (jobs! root cli)
       (let [source (source-dataset root)]
         (with-lock root #(case action
