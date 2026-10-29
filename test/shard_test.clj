@@ -2950,6 +2950,73 @@ sys.exit(2)")
           (is (str/includes? (:out r) "SHARD REPORT pass")
               "Handoffs must preserve exact-once receipt completion"))))))
 
+(deftest readable-report-preserves-edn-and-surfaces-fatal-cause
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx [(job "alpha" ["bash" "-c" "exit 1"])
+                      (job "beta" ["bash" "-c" "true"])])
+      (seed-explain-result! fx "alpha" :failed
+                            (str "ERROR in (example) (test.clj:10)\n"
+                                 "  actual: Browser closed\n"
+                                 "Caused by: TargetClosedError\n"
+                                 "[pid=55][err] FATAL: Socket path too long: /long/path/SingletonSocket\n"))
+      (seed-explain-result! fx "beta" :passed "ok\n")
+      (let [human (invoke fx "report" (str (:run fx)))
+            machine (report fx)]
+        (is (= 1 (:exit human)))
+        (is (= 1 (:exit machine)))
+        (is (= :fail (get-in machine [:edn :overall])))
+        (is (str/includes? (:out human) "SHARD REPORT fail"))
+        (is (str/includes? (:out human) "OUTCOMES"))
+        (is (str/includes? (:out human) "EXECUTION"))
+        (is (str/includes? (:out human) "Fatal diagnostic:"))
+        (is (str/includes? (:out human) "Socket path too long"))
+        (is (< (.indexOf ^String (:out human) "Fatal diagnostic:")
+               (.indexOf ^String (:out human) "Failure entries:")))
+        (is (not (str/includes? (:out (invoke fx "report" (str (:run fx)) "--edn"))
+                                 "OUTCOMES")))))))
+
+(deftest readable-ygg-timeline-summary-and-details
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx [(job "alpha" ["bash" "-c" "true"])
+                      (job "beta" ["bash" "-c" "true"])])
+      (seed-explain-result! fx "alpha" :passed "ok\n")
+      (seed-explain-result! fx "beta" :passed "ok\n")
+      (let [runs (file (:project fx) ".ygg" "runs")
+            destination (file runs "run-output-fixture")
+            ygg-path (file (System/getProperty "user.dir") "ygg")
+            wrapper (file (:bin fx) "shard")
+            _ (.mkdirs runs)
+            _ (Files/move (.toPath (:run fx)) (.toPath destination)
+                          (make-array java.nio.file.CopyOption 0))]
+        (spit wrapper (str "#!/bin/sh\nexec " (pr-str (:bb fx)) " "
+                           (pr-str (:shard fx)) " \"$@\"\n"))
+        (.setExecutable wrapper true)
+        (let [args [(:bb fx) (str ygg-path) "timeline" "--run"
+                    "run-output-fixture" (str (:project fx))]
+              full (exec! (:project fx) args {})
+              brief (exec! (:project fx) (into (subvec (vec args) 0 3)
+                                             (concat ["--summary"] (subvec (vec args) 3))) {})
+              alias (exec! (:project fx)
+                           [(:bb fx) (str ygg-path) "report" "--timeline"
+                            "--summary" "--run" "run-output-fixture"
+                            (str (:project fx))] {})
+              rejected (exec! (:project fx)
+                              [(:bb fx) (str ygg-path) "jobs" "--summary"
+                               "--run" "run-output-fixture"
+                               (str (:project fx))] {})]
+          (is (= 0 (:exit full)) (:out full))
+          (is (= 0 (:exit brief)) (:out brief))
+          (is (= 0 (:exit alias)) (:out alias))
+          (is (not= 0 (:exit rejected)))
+          (is (str/includes? (:out rejected) "--summary is supported only"))
+          (is (str/includes? (:out brief) "WORKER  JOBS"))
+          (is (str/includes? (:out brief) "Last completed:"))
+          (is (not (str/includes? (:out brief) "PER-WORKER JOB DETAILS")))
+          (is (str/includes? (:out full) "PER-WORKER JOB DETAILS"))
+          (is (str/includes? (:out full) "alpha")))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
