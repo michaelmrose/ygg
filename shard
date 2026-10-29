@@ -2397,7 +2397,7 @@
       :else (fail! "Usage: shard run --workers N [--scope SCOPE | --inventory COMMAND ARG ...]"))))
 
 (def ^:private supported-gesso-scopes
-  #{"all" "jvm" "formal" "cljs" "node" "node:choreo" "node:browser"
+  #{"all" "quick" "jvm" "formal" "cljs" "node" "node:choreo" "node:browser"
     "browser" "browser:integration" "advanced" "themes"})
 
 (defn- gesso-project? [root]
