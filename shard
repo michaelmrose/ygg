@@ -493,56 +493,19 @@
          "-Djava.io.tmpdir=" (quoted tmp)
          " -Duser.home=" (quoted home))))
 
-;; Chromium's direct CLJS gate already supplies --disable-gpu.  The real
-;; Playwright integration gate uses GESSO_CHROMIUM to select an executable,
-;; not to supply flags.  A generated wrapper lives *inside the verified worker
-;; clone*, so the original source checkout stays clean and no user commit is
-;; needed.  This is a headless-GPU diagnostic/compatibility policy, not a
-;; relaxation of Bubblewrap isolation or proof of the SIGTRAP root cause.
-(def ^:private chromium-no-gpu-script
-  (str "#!/bin/sh\n"
-       "set -eu\n"
-       "if [ -n \"${SHARD_CHROMIUM_ORIGINAL:-}\" ]; then\n"
-       "  exec \"$SHARD_CHROMIUM_ORIGINAL\" --disable-gpu \"$@\"\n"
-       "fi\n"
-       "for browser in chromium chromium-browser google-chrome google-chrome-stable; do\n"
-       "  if command -v \"$browser\" >/dev/null 2>&1; then\n"
-       "    exec \"$browser\" --disable-gpu \"$@\"\n"
-       "  fi\n"
-       "done\n"
-       "echo 'Shard: no Chromium executable found for Playwright' >&2\n"
-       "exit 127\n"))
+;; Browser jobs use Chromium and Playwright, which create AF_UNIX sockets
+;; beneath TMPDIR.  A worker's owned clone path can be much longer than the
+;; approximately 107-byte Linux pathname-socket limit.  In every bwrap job
+;; /tmp is already a fresh writable tmpfs, isolated by mount namespace, so
+;; it is both shorter and *more* isolated than a clone-relative TMPDIR.
+;; Keep the regular worker environment for all other gates and the JVM
+;; session control socket (which runs under separate admission policy).
+(def ^:private browser-temp-gates #{:browser :browser:integration})
 
-(defn- chromium-wrapper! [worker-env]
-  (let [root (some-> (get worker-env "SHARD_WORKER_ENV_ROOT") io/file .toPath)]
-    (require! (and root (Files/isDirectory root worker-env-no-follow))
-              "Browser integration requires a verified private worker directory")
-    (let [wrapper (Files/createTempFile
-                   root "chromium-no-gpu-" ".sh"
-                   (into-array FileAttribute
-                               [(PosixFilePermissions/asFileAttribute
-                                 worker-private-permissions)]))]
-      (try
-        (Files/writeString wrapper chromium-no-gpu-script
-                           (make-array OpenOption 0))
-        (require! (and (Files/isRegularFile wrapper worker-env-no-follow)
-                       (Files/isExecutable wrapper))
-                  "Private Chromium launcher is unavailable")
-        (str wrapper)
-        (catch Exception ex
-          (Files/deleteIfExists wrapper)
-          (throw ex))))))
-
-(defn- configure-browser-gate! [job ^java.util.Map env worker-env]
-  ;; Job identity comes from the validated inventory, not from an untrusted
-  ;; shell-command substring.  Preserve any explicit caller browser selection.
-  (when (= :browser:integration (:gate job))
-    (let [original (some-> (.get env "GESSO_CHROMIUM") str/trim not-empty)
-          wrapper (chromium-wrapper! worker-env)]
-      (if original
-        (.put env "SHARD_CHROMIUM_ORIGINAL" original)
-        (.remove env "SHARD_CHROMIUM_ORIGINAL"))
-      (.put env "GESSO_CHROMIUM" wrapper))))
+(defn- configure-browser-gate! [job ^java.util.Map env]
+  (when (contains? browser-temp-gates (:gate job))
+    (doseq [key ["TMPDIR" "TMP" "TEMP"]]
+      (.put env key "/tmp"))))
 
 ;; Keep the scheduler, claims, logs and process-group supervision OUTSIDE
 ;; Bubblewrap. Each job gets a fresh network namespace. Because a worker runs
@@ -706,10 +669,10 @@
     (.redirectErrorStream builder true)
     (.redirectOutput builder (ProcessBuilder$Redirect/to logfile))
     (.putAll env worker-env)
-    (configure-browser-gate! job env worker-env)
+    (configure-browser-gate! job env)
     (.put env "JAVA_TOOL_OPTIONS"
           (java-tool-options-for-worker (.get env "JAVA_TOOL_OPTIONS")
-                                        (get worker-env "TMPDIR")
+                                        (.get env "TMPDIR")
                                         (get worker-env "HOME")))
     (.put env "SHARD_JOB_ID" (:id job))
     (.put env "SHARD_WORKSPACE" (.getCanonicalPath workspace))
