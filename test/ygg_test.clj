@@ -195,6 +195,19 @@
           (successful! (run-ygg fx "status" "--edn"))
           (is (= inode (lock-file-key fx))))))))
 
+(deftest terminal-formatting-is-opt-in-for-pipes-and-keeps-edn-plain
+  (with-fixture
+    (fn [fx]
+      (let [plain (successful! (run-ygg fx "status" "--no-color" "--ascii"))
+            vivid (successful! (run-ygg fx "status" "--color=always" "--unicode"))
+            edn (successful! (run-ygg fx "status" "--edn" "--color=always" "--unicode"))
+            help-result (successful! (run-ygg fx "--help"))]
+        (is (not (str/includes? (:out plain) "\u001b[")))
+        (is (str/includes? (:out vivid) "\u001b[33m"))
+        (is (not (str/includes? (:out edn) "\u001b[")))
+        (is (= :idle (:status (edn/read-string (:out edn)))))
+        (is (str/includes? (:out help-result) "--color=auto|always|never"))))))
+
 (deftest clones-are-separate-workspaces-and-clean-preserves-run-history
   (with-fixture
     (fn [fx]
@@ -465,7 +478,18 @@
           (is (str/includes? text "3.0s"))
           (is (not (str/includes? text "HANDOFF / between-process gap")))
           (is (not (str/includes? (:out summary) "PER-SHARD JOB DETAILS")))
-          (is (str/includes? (:out summary) "Actual shard processes: 4")))
+          (is (str/includes? (:out summary) "Actual shard processes: 4"))
+          (let [unicode (successful! (run-ygg fx "timeline" "--summary"
+                                                "--unicode" "--color=always"
+                                                "--run" "run-slot-fixture"))
+                ascii (successful! (run-ygg fx "timeline" "--summary"
+                                              "--ascii" "--no-color"
+                                              "--run" "run-slot-fixture"))]
+            (is (str/includes? (:out unicode) "█"))
+            (is (str/includes? (:out unicode) "░"))
+            (is (str/includes? (:out unicode) "\u001b["))
+            (is (str/includes? (:out ascii) "#"))
+            (is (not (str/includes? (:out ascii) "\u001b[")))))
         ;; An older run has no claim-loop markers, so do not fabricate idle
         ;; tails using the global run's last completion.
         (spit (path run "worker-1-phase-1.log")
