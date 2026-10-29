@@ -1739,12 +1739,21 @@
                 (recur (:queues better) (inc iteration))
                 best))))))))
 
-(defn- previous-run-data [root]
-  ;; Only complete, validated historical results are inputs to a warm start.
-  ;; A broken/partial run must never prevent a fresh run from starting.
+;; Bound the amount of history examined even after hundreds of project runs.
+;; Within that recent history, each job uses its last 8 successful executions;
+;; a scoped run contributes only to jobs it actually completed.  Immutable,
+;; validated receipts remain the authority; there is no second mutable timing
+;; database to become inconsistent with a run's published evidence.
+(def ^:private duration-sample-window 8)
+(def ^:private duration-history-scan-limit 64)
+
+(defn- recent-run-data [root]
+  ;; Historical files are advisory.  Invalid, incomplete and symlinked runs
+  ;; must not break admission; all usable reports still undergo validation.
   (let [runs (io/file root ".ygg" "runs")]
-    (some (fn [^java.io.File dir]
-            (when (and (.isDirectory dir) (not (Files/isSymbolicLink (.toPath dir)))
+    (keep (fn [^java.io.File dir]
+            (when (and (.isDirectory dir)
+                       (not (Files/isSymbolicLink (.toPath dir)))
                        (.isFile (io/file dir "jobs.edn"))
                        (.isFile (io/file dir "schedule.edn")))
               (try
@@ -1759,18 +1768,37 @@
                     {:schedule schedule :report report}))
                 (catch Exception _ nil))))
           (->> (or (.listFiles runs) [])
-               (sort-by #(.getName ^java.io.File %) #(compare %2 %1))))))
+               (filter #(and (.isDirectory ^java.io.File %)
+                             (not (Files/isSymbolicLink (.toPath ^java.io.File %)))))
+               (sort-by #(.getName ^java.io.File %) #(compare %2 %1))
+               (take duration-history-scan-limit)))))
+
+(defn- recent-duration-averages [history job-ids]
+  (let [observations
+        (reduce (fn [acc {:keys [report]}]
+                  (reduce (fn [samples {:keys [id duration-ms status]}]
+                            (if (and (contains? job-ids id)
+                                     (= :passed status)
+                                     (integer? duration-ms)
+                                     (pos? duration-ms)
+                                     (< (count (get samples id []))
+                                        duration-sample-window))
+                              (update samples id (fnil conj []) duration-ms)
+                              samples))
+                          acc (:jobs report)))
+                {} history)]
+    (into {} (for [[id durations] observations
+                   :when (seq durations)]
+               [id (long (Math/round (/ (double (reduce + durations))
+                                         (count durations))))]))))
 
 (defn- prepare-schedule [root manifest specs]
   (let [jobs (:jobs manifest)
-        previous (previous-run-data root)
-        observed (into {}
-                       (for [{:keys [id duration-ms]} (get-in previous [:report :jobs])
-                             :when (and (integer? duration-ms) (pos? duration-ms))]
-                         [id duration-ms]))
-        ;; Unknown jobs are conservatively treated as moderately expensive.
-        ;; Use actual observations from the latest complete run, not the old
-        ;; estimates that produced its planned allocation.
+        history (vec (recent-run-data root))
+        observed (recent-duration-averages history (set (map :id jobs)))
+        ;; Missing jobs get a conservative median of other job estimates,
+        ;; never a timing copied from a failed launch or a scoped job's sole
+        ;; execution.  No observations at all preserves the 60s baseline.
         known (sort (vals observed))
         default-ms (if (seq known)
                      (max 1000 (nth known (quot (count known) 2)))
@@ -1778,12 +1806,15 @@
         estimated (into {} (for [{:keys [id]} jobs]
                              [id (long (max 1 (get observed id default-ms)))]))
         fresh (lpt-queues jobs specs estimated)
-        old-schedule (:schedule previous)
-        old-queues (:queues old-schedule)
-        warm? (and (= (count specs) (:worker-count old-schedule))
-                   (= (mapv :runtime specs) (:runtimes old-schedule))
-                   (valid-queues? old-queues specs jobs))
-        warm (when warm? old-queues)
+        ;; A recent scoped run should not eclipse a still-compatible older
+        ;; full-run queue.  Warm-start only from validated compatible history.
+        previous (some (fn [{:keys [schedule] :as datum}]
+                         (when (and (= (count specs) (:worker-count schedule))
+                                    (= (mapv :runtime specs) (:runtimes schedule))
+                                    (valid-queues? (:queues schedule) specs jobs))
+                           datum))
+                       history)
+        warm (get-in previous [:schedule :queues])
         initial (if (and warm
                          (not (pos? (compare (score-queues warm estimated)
                                              (score-queues fresh estimated)))))
