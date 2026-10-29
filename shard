@@ -1032,6 +1032,11 @@
      (when owned? (reset! active-jvm-session session))
      (try
         (println "SHARD WORKER" worker-id "runtime" runtime "jobs" (count matching))
+        ;; Timestamp the admitted worker's CLAIM LOOP, not its ZFS queue or
+        ;; JVM startup. The matching end marker is written before JVM teardown.
+        ;; These are observational log events; immutable job receipts remain
+        ;; authoritative for ownership and job timing.
+        (println "SHARD WORKER LOOP START" worker-id (str (Instant/now)))
         (flush)
         (loop [idle-start (System/currentTimeMillis)]
       (let [results (read-results! run manifest)
@@ -1081,6 +1086,8 @@
                        "unclaimed" (count unclaimed))
               (flush)))))
        (finally
+         (println "SHARD WORKER LOOP END" worker-id (str (Instant/now)))
+         (flush)
          (when owned?
            ;; Retain the handle if teardown fails. An interruption hook can
            ;; then retry the abort; never discard an unsafe live session.
@@ -1411,8 +1418,11 @@
                                :jobs (count tasks)
                                :busy-ms busy-ms
                                :span-ms span-ms
-                               :idle-within-ms (max 0 (- span-ms busy-ms))
-                               :idle-tail-ms (milliseconds-between finish last-finish)})))
+                               ;; Only job-to-job gaps are measurable from
+                               ;; receipts. A worker may have EXITED well before
+                               ;; the global run ended; never label that interval
+                               ;; "idle tail".
+                               :idle-within-ms (max 0 (- span-ms busy-ms))})))
                      (sort-by :worker-id)
                      vec)]
     {:jobs (count finished)
@@ -1431,15 +1441,14 @@
       (println "Observed execution (from" jobs "completed receipts):")
       (println "  Job window:" (human-duration job-window-ms)
                "(first job start to last completion; excludes setup/cleanup)")
-      (println "  Worker activity (busy = sum of jobs, gaps = between jobs, tail = to run end):")
-      (println "  WORKER   JOBS        BUSY       GAPS       TAIL")
-      (doseq [{:keys [worker-id jobs busy-ms idle-within-ms idle-tail-ms]}
+      (println "  SHARD processes (receipts only; gaps exclude first/last-job idle):")
+      (println "  SHARD     JOBS        BUSY       BETWEEN-JOB GAPS")
+      (doseq [{:keys [worker-id jobs busy-ms idle-within-ms]}
               workers]
-        (println (format "  Worker %-8s jobs %3d  busy %9s  gaps %9s  tail %9s"
+        (println (format "  Shard %-8s jobs %3d  busy %9s  gaps %9s"
                          (subs worker-id 0 (min 8 (count worker-id)))
                          jobs (human-duration busy-ms)
-                         (human-duration idle-within-ms)
-                         (human-duration idle-tail-ms))))
+                         (human-duration idle-within-ms))))
       (println "  Slowest completed jobs:")
       (doseq [{:keys [id duration-ms worker-id status]} slowest]
         (println "   " (human-duration duration-ms) id
