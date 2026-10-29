@@ -2724,6 +2724,62 @@ sys.exit(2)")
           (finally
             (reset! interrupted false)))))))
 
+;; v1175: Shard must inject --disable-gpu into real Playwright launches
+;; without adding uncommitted files to the source ZFS dataset.  The wrapper
+;; lives under a private worker root and only browser:integration opts in.
+(deftest browser-integration-uses-private-no-gpu-chromium-wrapper
+  (with-fixture
+    (fn [fx]
+      (let [embedded (persistent-shard-namespace!)
+            ns (-> (:worker embedded) meta :ns)
+            make-env (ns-resolve ns 'create-worker-environment!)
+            configure (ns-resolve ns 'configure-browser-gate!)
+            chrome (file (:base fx) "fake-chromium")
+            _ (spit chrome "#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
+            _ (is (.setExecutable chrome true))
+            worker-env (make-env (:workspace fx) "gpu-wrapper-test")
+            selected (doto (java.util.HashMap.)
+                       (.put "GESSO_CHROMIUM" (.getAbsolutePath chrome)))
+            unchanged (doto (java.util.HashMap.)
+                        (.put "GESSO_CHROMIUM" (.getAbsolutePath chrome)))]
+        (is (every? some? [make-env configure]))
+        (configure {:gate :browser:integration} selected worker-env)
+        (let [wrapper (get selected "GESSO_CHROMIUM")]
+          (is (str/starts-with? wrapper (get worker-env "SHARD_WORKER_ENV_ROOT")))
+          (is (.canExecute (file wrapper)))
+          (is (= (.getAbsolutePath chrome) (get selected "SHARD_CHROMIUM_ORIGINAL")))
+          (let [result (exec! (:workspace fx) [wrapper "--headless" "about:blank"]
+                              {"SHARD_CHROMIUM_ORIGINAL" (get selected "SHARD_CHROMIUM_ORIGINAL")})]
+            (is (zero? (:exit result)) (:out result))
+            (is (= ["--disable-gpu" "--headless" "about:blank"]
+                   (str/split-lines (str/trim (:out result))))
+                (:out result)))
+          (is (not (.exists (file (:project fx) "chromium-no-gpu")))
+              "The source checkout must not acquire a browser wrapper"))
+        (configure {:gate :browser} unchanged worker-env)
+        (is (= (.getAbsolutePath chrome) (get unchanged "GESSO_CHROMIUM"))
+            "The direct Chromium gate keeps its existing command")
+        (is (nil? (get unchanged "SHARD_CHROMIUM_ORIGINAL")))
+        (let [without-override (java.util.HashMap.)]
+          (configure {:gate :browser:integration} without-override worker-env)
+          (is (.canExecute (file (get without-override "GESSO_CHROMIUM"))))
+          (is (nil? (get without-override "SHARD_CHROMIUM_ORIGINAL"))))))))
+
+(deftest browser-wrapper-rejects-unverified-private-home
+  (with-fixture
+    (fn [fx]
+      (let [embedded (persistent-shard-namespace!)
+            configure (ns-resolve (-> (:worker embedded) meta :ns)
+                                  'configure-browser-gate!)
+            result (try
+                     (configure {:gate :browser:integration}
+                                (java.util.HashMap.)
+                                {"SHARD_WORKER_ENV_ROOT" "/does-not-exist"})
+                     nil
+                     (catch clojure.lang.ExceptionInfo ex ex))]
+        (is (instance? clojure.lang.ExceptionInfo result))
+        (is (str/includes? (.getMessage result) "verified private worker"))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
