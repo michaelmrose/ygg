@@ -928,6 +928,10 @@ sys.exit(2)")
   (doseq [[scope jobs]
           [["jvm" [(prepared-job "jvm-a" :jvm "gesso.sample-a-test")
                    (prepared-job "jvm-b" :jvm "gesso.sample-b-test")]]
+           ;; Quick is an ordinary prepared Gesso scope: only its nine pinned
+           ;; JVM namespace jobs are eligible, never the entire JVM corpus.
+           ["quick" [(prepared-job "quick-semantics" :jvm "gesso.choreo.semantics-test")
+                     (prepared-job "quick-command" :jvm "gesso.model.command-test")]]
            ["node:browser" [(prepared-job "node-browser" :node:browser "node:browser")]]]]
     (with-fixture
       (fn [fx]
