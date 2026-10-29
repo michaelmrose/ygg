@@ -2769,6 +2769,95 @@ sys.exit(2)")
               (partition 2 1 opts))
         "Short /tmp is still a per-job tmpfs, never the shared host /tmp")))
 
+;; v1180: Duration history is derived from complete, validated immutable run
+;; receipts.  In particular, a targeted single-gate run must not reset all
+;; other job estimates, and failed browser launches are not durations to learn.
+(defn- seed-schedule-history-run!
+  [fx ordinal jobs observations]
+  (let [run (file (:project fx) ".ygg" "runs"
+                  (format "run-20261029-%06d-history" ordinal))
+        historical (assoc fx :run run)]
+    (.mkdirs (file (:project fx) ".ygg" "runs"))
+    (enumerate! historical jobs)
+    (let [manifest (read-manifest historical)]
+      (doseq [[id {:keys [status duration-ms]}] observations]
+        (seed-explain-result! historical id status "historical timing evidence\n")
+        (let [path (file run "results" (str id ".edn"))]
+          (spit path (pr-str (assoc (edn/read-string (slurp path))
+                                    :duration-ms duration-ms)))))
+      (spit (file run "schedule.edn")
+            (pr-str {:format :shard/schedule :version 1
+                     :inventory-sha256 (:inventory-sha256 manifest)
+                     :worker-count 1 :runtimes [:jvm]
+                     :queues [(mapv :id jobs)]
+                     :estimated-ms (zipmap (map :id jobs) (repeat 1000))})))
+    run))
+
+(deftest scheduling-uses-bounded-per-job-history-not-latest-scoped-run
+  (with-fixture
+    (fn [fx]
+      (let [a (job "alpha" ["true"])
+            b (job "beta" ["true"])
+            c (job "gamma" ["true"])
+            jobs [a b c]
+            embedded (persistent-shard-namespace!)
+            shard-ns (-> (:worker embedded) meta :ns)
+            prepare (ns-resolve shard-ns 'prepare-schedule)
+            report-data (ns-resolve shard-ns 'report-data!)
+            specs [{:index 1 :workspace (str (:workspace fx)) :runtime :jvm}]]
+        (is (some? prepare))
+        ;; Very old measurements must not affect the rolling eight-sample
+        ;; average, while beta's older valid measurement must survive ten
+        ;; newer *scoped* runs that do not include beta at all.
+        (seed-schedule-history-run! fx 1 [a b]
+                                    {"alpha" {:status :passed :duration-ms 900000}
+                                     "beta"  {:status :passed :duration-ms 45000}})
+        (doseq [index (range 2 12)]
+          (seed-schedule-history-run!
+            fx index [a]
+            {"alpha" {:status :passed
+                       :duration-ms (cond (<= index 3) 900000
+                                          (= index 11) 9000
+                                          :else 1000)}}))
+        (let [failed (seed-schedule-history-run!
+                       fx 12 [a]
+                       {"alpha" {:status :failed :duration-ms 10}})
+              incomplete (seed-schedule-history-run! fx 13 [a] {})
+              _ (is (= :fail (:overall (report-data (str failed) false))))
+              _ (is (= :incomplete (:overall (report-data (str incomplete) false))))
+              current (do (enumerate! fx jobs) (read-manifest fx))
+              schedule (prepare (:project fx) current specs)]
+          (is (= 2000 (get-in schedule [:estimated-ms "alpha"]))
+              "The eight newest successful alpha durations average to 2s")
+          (is (= 45000 (get-in schedule [:estimated-ms "beta"]))
+              "Ten unrelated scoped runs must not discard beta history")
+          (is (= 45000 (get-in schedule [:estimated-ms "gamma"]))
+              "Unseen jobs use the median of current rolling estimates")
+          (is (= :lpt (:origin schedule))
+              "A previous scoped queue cannot warm-start a different inventory")
+          (is (= #{"alpha" "beta" "gamma"}
+                 (set (mapcat identity (:queues schedule)))))
+          ;; A successful subsequent run updates alpha's rolling window;
+          ;; it doesn't accumulate a lifetime average of the old 900s runs.
+          (seed-schedule-history-run!
+            fx 14 [a] {"alpha" {:status :passed :duration-ms 9000}})
+          (is (= 3000 (get-in (prepare (:project fx) current specs)
+                              [:estimated-ms "alpha"]))))))))
+
+(deftest scheduling-empty-history-retains-safe-default
+  (with-fixture
+    (fn [fx]
+      (let [jobs [(job "new" ["true"])]
+            embedded (persistent-shard-namespace!)
+            shard-ns (-> (:worker embedded) meta :ns)
+            prepare (ns-resolve shard-ns 'prepare-schedule)
+            _ (enumerate! fx jobs)
+            schedule (prepare (:project fx) (read-manifest fx)
+                              [{:index 1 :workspace (str (:workspace fx))
+                                :runtime :jvm}])]
+        (is (= 60000 (get-in schedule [:estimated-ms "new"])))
+        (is (= :lpt (:origin schedule)))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
