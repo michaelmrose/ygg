@@ -703,6 +703,66 @@
     ;; Keep report's success/failure status, unlike the exploratory jobs list.
     (when-not (= :pass (:overall report)) (System/exit 1))))
 
+;; Help is a pure read-only operation: no Git/ZFS probes, config loading,
+;; privilege escalation, lock acquisition, or repository requirement.
+(defn- print-help! []
+  (doseq [line
+          ["Ygg — ZFS-backed workspaces and read-only Shard run inspection"
+           ""
+           "Usage:"
+           "  ygg help | ygg --help | ygg -h"
+           "  ygg create [-n N] [ROOT]"
+           "  ygg status [--edn] [ROOT]"
+           "  ygg clean [ROOT]"
+           "  ygg tail [--workers|--stderr|--all] [--once] [--run RUN] [ROOT]"
+           "  ygg report [--edn|--timeline] [--run RUN] [ROOT]"
+           "  ygg explain [--run RUN] [ROOT]"
+           "  ygg jobs [--all] [--sort duration|error] [--run RUN] [ROOT]"
+           "  ygg timeline [--run RUN] [ROOT]"
+           ""
+           "Workspace commands:"
+           "  create     Snapshot the root ZFS dataset and mount N verified clones"
+           "             at ROOT/.ygg/workers/1 ... N (default N=1; allowed 1..256)."
+           "  status     Show verified clone/snapshot status; --edn emits EDN."
+           "  clean      Safely unmount/destroy recorded clones; retain the source snapshot."
+           ""
+           "Run inspection commands (read-only; no ZFS privileges or locks):"
+           "  tail       Follow last 10 lines and subsequent lines of JVM logs (default)."
+           "             --workers selects worker logs; --stderr JVM stderr only;"
+           "             --all includes worker logs and JVM stdout/stderr."
+           "             --once prints one snapshot and exits; Ctrl-C stops following."
+           "  report     Print the validated Shard run summary; --edn emits EDN;"
+           "             --timeline shows a worker/job timing reconstruction."
+           "  explain    Explain failed or incomplete jobs using Shard diagnostics."
+           "  jobs       List 20 slowest completed jobs by default; --all lists all;"
+           "             --sort duration (default) or error (absolute estimate delta)."
+           "  timeline   Show worker job ordering, busy time, gaps and idle tails."
+           ""
+           "Options and paths:"
+           "  ROOT       Repository/ZFS dataset root (default: current directory)."
+           "  --run RUN  Published run name (run-...) or absolute path inside"
+           "             ROOT/.ygg/runs/; defaults to the safe latest symlink."
+           "  -n N       Clone count for create; other commands do not use -n."
+           "  --edn      Available only for status and report."
+           "  --help,-h  Print this complete help; valid with any command."
+           ""
+           "Configuration and prerequisites:"
+           "  ygg.edn    Optional map supplying :action and :n defaults."
+           "  ZFS        create/status/clean require repository at the dataset root;"
+           "             mutations use sudo -n -- zfs (authorize with sudo -v)."
+           "  Safety     Shard holds .ygg/.workers.lock while using clones;"
+           "             Ygg mutations serialize on .ygg/.command.lock."
+           "             An old .ygg.lock blocks mixed-version mutation."
+           ""
+           "Gesso integration (commands run from the Gesso repository):"
+           "  bb test -n 6               Run all selected test jobs through Ygg/Shard."
+           "  bb test:browser:integration -n 1  Run that gate in one isolated worker."
+           "  ygg explain               Inspect failures in the latest published run."
+           "  ygg jobs --all             Review all measured job durations."
+           "  ygg timeline               Review per-worker scheduling and idle time."]]
+    (println line))
+  (flush))
+
 (defn- parse-args [argv]
   (loop [xs (seq argv) parsed {}]
     (if (empty? xs)
@@ -733,11 +793,10 @@
           (= "--once" x)
           (do (when (:once? parsed) (fail! "Duplicate --once"))
               (recur (next xs) (assoc parsed :once? true)))
-          (#{"--workers" "--stderr" "--all"} x)
+          (#{"--workers" "--stderr"} x)
           (do (when (:mode parsed) (fail! "Only one tail output mode is allowed"))
               (recur (next xs) (assoc parsed :mode ({"--workers" :workers
-                                                     "--stderr" :stderr
-                                                     "--all" :all} x))))
+                                                     "--stderr" :stderr} x))))
           (= "--edn" x)
           (do (when (:edn? parsed) (fail! "Duplicate --edn"))
               (recur (next xs) (assoc parsed :edn? true)))
@@ -801,14 +860,18 @@
       (fail! "Output modes are supported only for tail"))
     (when (and (not= action :tail) (:once? cli))
       (fail! "--once is supported only for tail"))
-    (when (and (not= action :jobs) (or (:all? cli) (:sort cli)))
-      (fail! "--all and --sort are supported only for jobs"))
+    (when (and (:all? cli) (not (#{:jobs :tail} action)))
+      (fail! "--all is supported only for jobs and tail"))
+    (when (and (:sort cli) (not= action :jobs))
+      (fail! "--sort is supported only for jobs"))
+    (when (and (= action :tail) (:all? cli) (:mode cli))
+      (fail! "Only one tail output mode is allowed"))
     (when (and (not (#{:tail :report :explain :jobs :timeline} action)) (:run cli))
       (fail! "--run is supported only for tail, report, explain, jobs and timeline"))
     (when (and (#{:tail :report :explain :jobs :timeline} action) (:n cli))
       (fail! "-n is not supported for tail, report, explain, jobs or timeline"))
     (case action
-      :tail (tail! root cli)
+      :tail (tail! root (cond-> cli (:all? cli) (assoc :mode :all)))
       :report (if (:timeline? cli) (timeline! root cli) (report! root cli))
       :timeline (timeline! root cli)
       :explain (explain! root cli)
@@ -819,7 +882,9 @@
                            :clean (with-worker-idle root (fn [] (clean! root source)))
                            :status (status! root source (:edn? cli))))))))
 (try
-  (apply -main *command-line-args*)
+  (if (some #{"help" "--help" "-h"} *command-line-args*)
+    (print-help!)
+    (apply -main *command-line-args*))
   (catch Exception e
     (binding [*out* *err*]
       (println "ygg:" (.getMessage e))
