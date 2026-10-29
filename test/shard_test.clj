@@ -2858,6 +2858,98 @@ sys.exit(2)")
         (is (= 60000 (get-in schedule [:estimated-ms "new"])))
         (is (= :lpt (:origin schedule)))))))
 
+(deftest scheduling-allocates-by-predicted-runtime-work-not-job-count
+  (with-fixture
+    (fn [fx]
+      (let [embedded (persistent-shard-namespace!)
+            ns (-> (:worker embedded) meta :ns)
+            specs (ns-resolve ns 'worker-specs)
+            profile (ns-resolve ns 'runtime-worker-quotas)
+            clones (mapv (fn [i] {:mountpoint (str (file (:base fx) "clone" (str i)))})
+                         (range 6))
+            ;; 100 cheap jobs should NOT get five workers while four very
+            ;; expensive gates receive only one.
+            jobs (vec (concat (for [i (range 100)]
+                                (assoc (job (str "cheap-" i) ["true"])
+                                       :runtime :cheap))
+                              (for [i (range 4)]
+                                (assoc (job (str "expensive-" i) ["true"])
+                                       :runtime :expensive))))
+            estimates (into {} (for [{:keys [id runtime]} jobs]
+                                 [id (if (= runtime :cheap) 100 100000)]))
+            quotas (profile jobs estimates 6)
+            assigned (specs clones jobs estimates)]
+        (is (= 6 (count assigned)))
+        (is (= 6 (reduce + (vals quotas))))
+        (is (= (frequencies (map :runtime assigned)) quotas))
+        (is (= 2 (:cheap quotas)) "Cheap tests need far fewer workers")
+        (is (= 4 (:expensive quotas)) "Expensive tests receive one worker per costly job")
+        (is (= assigned (specs clones jobs estimates))
+            "Scheduling must remain deterministic")
+        (is (= {:cheap 1 :expensive 1}
+               (profile jobs estimates 2))
+            "Every declared runtime gets one worker if only two exist")))))
+
+(deftest scheduling-handoff-requires-claims-but-not-sibling-completion
+  (with-fixture
+    (fn [fx]
+      (let [embedded (persistent-shard-namespace!)
+            ns (-> (:worker embedded) meta :ns)
+            eligible? (ns-resolve ns 'runtime-work-fully-claimed?)
+            pick (ns-resolve ns 'reassignment-target)
+            java-jobs [(assoc (job "a" ["true"]) :runtime :jvm)
+                       (assoc (job "b" ["true"]) :runtime :jvm)]
+            node-jobs [(assoc (job "x" ["true"]) :runtime :node)
+                       (assoc (job "y" ["true"]) :runtime :node)]
+            jobs (vec (concat java-jobs node-jobs))
+            manifest {:jobs jobs}
+            run (:run fx)
+            claims (file run "claims")
+            results {"a" {:status :passed}}
+            estimate {"x" 90000 "y" 10000}]
+        (.mkdirs claims)
+        (is (false? (eligible? run manifest results :jvm))
+            "Unclaimed unfinished work forbids handoff")
+        (.mkdirs (file claims "b"))
+        (is (true? (eligible? run manifest results :jvm))
+            "A sibling may still be executing its already-claimed job")
+        (is (= :node (pick run manifest results :jvm estimate {})))
+        (.mkdirs (file claims "x"))
+        (.mkdirs (file claims "y"))
+        (is (nil? (pick run manifest results :jvm estimate {}))
+            "No worker is spawned when there is no ready unclaimed work")))))
+
+(deftest supervisor-hands-off-drained-worker-before-sibling-finishes
+  ;; Black-box supervisor + claims regression. Two :jvm workers start; one
+  ;; finishes its own claimed jobs while the other is still running.  The
+  ;; released clone may take ready :node work rather than waiting for the
+  ;; final JVM result (unlike the former runtime-wide drain rule).
+  (with-fixture
+    (fn [fx]
+      (let [jvm-jobs (mapv (fn [i]
+                             (assoc (job (str "j" i)
+                                         ["sh" "-c"
+                                          (if (= i 4) "sleep 2" "sleep 0.2")])
+                                    :runtime :jvm :timeout-ms 15000))
+                           (range 5))
+            node-jobs (mapv (fn [i]
+                              (assoc (job (str "n" i)
+                                          ["sh" "-c" "sleep 2"])
+                                     :runtime :node :timeout-ms 15000))
+                            (range 3))
+            jobs (vec (concat jvm-jobs node-jobs))]
+        (git-project! fx jobs)
+        (let [env (ygg-shim! fx)
+              r (exec! (:project fx)
+                       [(:bb fx) (:shard fx) "run" "--workers" "3"
+                        "--inventory" (:bb fx) "inventory.clj"]
+                       env 45000)]
+          (is (= 0 (:exit r)) (:out r))
+          (is (str/includes? (:out r) "SHARD WORKER HANDOFF")
+              "An idle JVM clone should help while a sibling JVM is active")
+          (is (str/includes? (:out r) "SHARD REPORT pass")
+              "Handoffs must preserve exact-once receipt completion"))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
