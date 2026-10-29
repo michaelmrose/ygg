@@ -608,61 +608,98 @@
                (assoc entry :start (Instant/parse (:started-at entry))
                             :finish (Instant/parse (:completed-at entry)))))))
 
-(defn- timeline-worker-bar [origin end tasks width]
+(defn- timeline-worker-bar [origin end {:keys [jobs measured-loop? loop-start loop-end]} width]
   (let [total (max 1 (timeline-elapsed-ms origin end))]
     (apply str
            (for [i (range width)
                  :let [lo (quot (* i total) width)
-                       hi (max (inc lo) (quot (* (inc i) total) width))]]
-             (if (some (fn [{job-start :start job-end :finish}]
-                         (and (< (timeline-elapsed-ms origin job-start) hi)
-                              (> (timeline-elapsed-ms origin job-end) lo))) tasks)
-               "#" ".")))))
+                       hi (max (inc lo) (quot (* (inc i) total) width))
+                       overlaps? (fn [^Instant started ^Instant finished]
+                                   (and (< (timeline-elapsed-ms origin started) hi)
+                                        (> (timeline-elapsed-ms origin finished) lo)))]]
+             (cond
+               (some (fn [{:keys [start finish]}] (overlaps? start finish)) jobs) "#"
+               (and measured-loop? (overlaps? loop-start loop-end)) ":"
+               :else " ")))))
 
-(defn- timeline-slot-info [run]
-  ;; Child worker UUIDs change at every cross-runtime handoff. The supervisor
-  ;; preserves the physical clone-slot number in worker-N[-phase-P].log. A
-  ;; log header is OBSERVATIONAL metadata, not proof of job ownership; the
-  ;; validated immutable result receipt still supplies each job's worker UUID.
+(defn- timeline-shard-logs [run]
+  ;; The UUID is the executor identity; the clone slot is merely the writable
+  ;; workspace it occupied. A runtime handoff creates a NEW shard process.
+  ;; The worker's claim-loop timestamps bound possible idle time; the global
+  ;; run's last completion does not say whether this process was still alive.
   (into {}
-        (keep (fn [[uuid label]]
-                (when-let [[_ slot phase]
-                           (re-matches #"worker-([1-9][0-9]*)(?:-phase-([1-9][0-9]*))?" label)]
-                  [uuid {:slot (Long/parseLong slot)
-                         :phase (if phase (Long/parseLong phase) 0)}])))
-        (tail-worker-ids run)))
+        (keep (fn [path]
+                (let [filename (str (.getFileName path))
+                      [_ slot phase] (re-matches tail-worker-name filename)]
+                  (with-open [reader (io/reader (.toFile path))]
+                    (let [header (.readLine reader)
+                          [_ uuid] (when header
+                                     (re-find #"^SHARD WORKER ([0-9a-f-]{36})\b" header))
+                          [_ declared-runtime] (when header
+                                                 (re-find #"\bruntime :([A-Za-z0-9._-]+)\b" header))]
+                      (when uuid
+                        (let [markers (loop [line (.readLine reader), start nil, end nil]
+                                        (if (nil? line)
+                                          {:loop-start start :loop-end end}
+                                          (let [[_ kind marker-id timestamp]
+                                                (re-matches #"SHARD WORKER LOOP (START|END) ([0-9a-f-]{36}) (\S+)" line)
+                                                parsed (when (= uuid marker-id)
+                                                         (try (Instant/parse timestamp)
+                                                              (catch Exception _ nil)))]
+                                            (recur (.readLine reader)
+                                                   (if (and parsed (= kind "START")) parsed start)
+                                                   (if (and parsed (= kind "END")) parsed end)))))]
+                          [uuid (merge {:worker-id uuid
+                                        :declared-runtime (when declared-runtime
+                                                            (keyword declared-runtime))
+                                        :slot (Long/parseLong slot)
+                                        :phase (if phase (Long/parseLong phase) 0)}
+                                       markers)])))))))
+        (tail-regular-files run tail-worker-name)))
 
-(defn- timeline-slots [completed known]
-  (->> completed
-       (group-by (fn [{:keys [worker-id]}]
-                   (if-let [slot (:slot (get known worker-id))]
-                     [:slot slot]
-                     [:unknown worker-id])))
-       (map (fn [[identity tasks]]
-              (let [jobs (vec (sort-by (juxt :start :finish :id) tasks))
-                    processes (->> jobs
-                                   (group-by :worker-id)
-                                   (map (fn [[uuid entries]]
-                                          (let [sorted (vec (sort-by (juxt :start :finish :id) entries))]
-                                            (merge {:worker-id uuid
-                                                    :runtime (:runtime (first sorted))
-                                                    :jobs sorted
-                                                    :first-start (:start (first sorted))}
-                                                   (get known uuid)))))
-                                   (sort-by (juxt :first-start :worker-id))
-                                   vec)]
-                {:identity identity :jobs jobs :processes processes
-                 :first-start (:start (first jobs))})))
-       (sort-by (fn [{[kind value] :identity :keys [first-start]}]
-                  [(if (= kind :slot) 0 1)
-                   (if (= kind :slot) value Long/MAX_VALUE)
-                   first-start]))
-       vec))
-
-(defn- timeline-slot-label [[kind value] ordinal]
-  (if (= kind :slot)
-    (str "S" value)
-    (str "U" ordinal)))
+(defn- timeline-shards [completed known]
+  (let [by-id (group-by :worker-id completed)]
+    (->> (concat (keys known) (keys by-id))
+         distinct
+         (map (fn [uuid]
+                (let [jobs (vec (sort-by (juxt :start :finish :id) (get by-id uuid [])))
+                      meta (get known uuid)
+                      first-job (first jobs)
+                      last-finish (when first-job
+                                    (reduce (fn [latest {:keys [finish]}]
+                                              (if (.isAfter ^Instant finish latest) finish latest))
+                                            (:finish first-job) (rest jobs)))
+                      gaps (reduce + 0
+                                   (for [[a b] (partition 2 1 jobs)]
+                                     (max 0 (timeline-elapsed-ms (:finish a) (:start b)))))
+                      busy (reduce + 0 (map :duration-ms jobs))
+                      loop-start (:loop-start meta)
+                      loop-end (:loop-end meta)
+                      valid-loop? (and loop-start loop-end
+                                       (not (.isAfter ^Instant loop-start loop-end))
+                                       (or (nil? first-job)
+                                           (and (not (.isAfter ^Instant loop-start (:start first-job)))
+                                                (not (.isBefore ^Instant loop-end last-finish)))))
+                      pre (when (and valid-loop? first-job)
+                            (timeline-elapsed-ms loop-start (:start first-job)))
+                      post (when (and valid-loop? first-job)
+                             (timeline-elapsed-ms last-finish loop-end))
+                      idle (when valid-loop?
+                             (if first-job
+                               (+ pre gaps post)
+                               (timeline-elapsed-ms loop-start loop-end)))]
+                  (merge meta
+                         {:worker-id uuid :jobs jobs
+                          :first-start (or (:start first-job) loop-start)
+                          :last-finish last-finish
+                          :busy-ms busy :gaps-ms gaps
+                          :pre-ms pre :post-ms post :idle-ms idle
+                          :measured-loop? (boolean valid-loop?)}))))
+         (sort-by (fn [{:keys [slot phase first-start worker-id]}]
+                    [(if slot 0 1) (or slot Long/MAX_VALUE)
+                     (or phase Long/MAX_VALUE) (or first-start Instant/EPOCH)
+                     worker-id]))
+         vec)))
 
 (defn- timeline! [root {:keys [run summary?]}]
   (let [selected (tail-run! root run)
@@ -675,111 +712,87 @@
               (reduce (fn [latest {:keys [finish]}]
                         (if (.isAfter ^Instant finish latest) finish latest))
                       (:finish (first ordered)) (rest ordered)))
-        known (timeline-slot-info selected)
-        slots (timeline-slots completed known)
-        unmapped (count (filter #(= :unknown (first (:identity %))) slots))
+        shards (timeline-shards completed (timeline-shard-logs selected))
+        unmapped (count (filter #(nil? (:slot %)) shards))
+        unmeasured (count (remove :measured-loop? shards))
         missing (- (:total report) (count completed))]
     (println "YGG TIMELINE" (name (:overall report))
              "run" (str (.getFileName selected)))
-    (println (str (apply str (repeat 78 "="))))
-    (println (format "Jobs: %d/%d  |  Clone slots observed: %d  |  Window: %s"
-                     (count completed) (:total report)
-                     (- (count slots) unmapped)
-                     (if (seq completed)
-                       (jobs-duration (timeline-elapsed-ms origin end)) "-")))
-    (when (seq completed)
-      (println "Window: first job start to last job finish (setup/cleanup excluded).")
-      (println "S# = stable clone slot; each new worker process/UUID is shown as a phase.")
-      (when (pos? unmapped)
-        (println "UNMAPPED:" unmapped
-                 "worker process(es) have no usable supervisor log; not merged by timing."))
+    (println (apply str (repeat 92 "=")))
+    (println (format "Jobs: %d/%d  |  Actual shard processes: %d  |  Job window: %s"
+                     (count completed) (:total report) (count shards)
+                     (if origin (jobs-duration (timeline-elapsed-ms origin end)) "-")))
+    (println "One row per actual executing shard UUID, never a scheduled queue.")
+    (println "SLOT = reused ZFS workspace; PHASE = successive process in that workspace.")
+    (println "BUSY = receipt durations; GAPS = time between that shard's jobs.")
+    (println "PRE/POST = time within the worker's recorded claim loop without a job;")
+    (println "they are '-' for older runs without lifecycle markers, NOT time to global run end.")
+    (when (pos? unmapped)
+      (println "UNMAPPED:" unmapped "shard(s) lack a reliable workspace log; no slot inferred."))
+    (when (pos? unmeasured)
+      (println "UNMEASURED IDLE:" unmeasured
+               "shard(s) lack complete claim-loop timestamps."))
+    (when origin
       (let [width 48]
-        (println (format "%-7s %s" "Slot" "0s")
-                 "→" (jobs-duration (timeline-elapsed-ms origin end)))
-        (doseq [[idx {:keys [identity jobs processes]}] (map-indexed vector slots)]
-          (println (format "%-7s %s  %s"
-                           (timeline-slot-label identity (inc idx))
-                           (timeline-worker-bar origin end jobs width)
-                           (if (= :slot (first identity))
-                             (str (count processes) " process(es)")
-                             (str "unmapped " (subs (second identity) 0 8)))))))
-      (println)
-      (println "SLOT     JOBS  PROC  FIRST     FINISH    BUSY      GAPS      TAIL")
-      (println (apply str (repeat 78 "-")))
-      (doseq [[idx {:keys [identity jobs processes]}] (map-indexed vector slots)]
-        (let [first-job (first jobs)
-              last-end (reduce (fn [latest {:keys [finish]}]
-                                 (if (.isAfter ^Instant finish latest) finish latest))
-                               (:finish first-job) (rest jobs))
-              busy (reduce + 0 (map :duration-ms jobs))
-              internal-gaps (reduce + 0
-                                    (map (fn [[a b]]
-                                           (max 0 (timeline-elapsed-ms (:finish a) (:start b))))
-                                         (partition 2 1 jobs)))
-              tail (max 0 (timeline-elapsed-ms last-end end))]
-          (println (format "%-8s %4d  %4d  %-9s %-9s %-9s %-9s %s"
-                           (timeline-slot-label identity (inc idx))
-                           (count jobs) (count processes)
-                           (jobs-duration (timeline-elapsed-ms origin (:start first-job)))
-                           (jobs-duration (timeline-elapsed-ms origin last-end))
-                           (jobs-duration busy) (jobs-duration internal-gaps)
-                           (jobs-duration tail)))))
+        (println)
+        (println "SHARD JOB EXECUTION: # running job, : admitted claim-loop without job, blank otherwise")
+        (println (format "%-15s %s  %s" "Shard" "0s"
+                         (jobs-duration (timeline-elapsed-ms origin end))))
+        (doseq [{:keys [worker-id slot phase] :as shard} shards]
+          (println (format "%-15s %s  slot %s phase %s"
+                           (subs worker-id 0 8)
+                           (timeline-worker-bar origin end shard width)
+                           (or slot "?") (or phase "?"))))))
+    (println)
+    (println "SHARD     SLOT PHASE RUNTIME          JOBS BUSY      PRE       GAPS      POST      IDLE")
+    (println (apply str (repeat 92 "-")))
+    (doseq [{:keys [worker-id slot phase declared-runtime jobs busy-ms pre-ms gaps-ms post-ms
+                    idle-ms]} shards]
+      (println (format "%-9s %-4s %-5s %-16s %4d %-9s %-9s %-9s %-9s %s"
+                       (subs worker-id 0 8)
+                       (if slot (str "S" slot) "?")
+                       (if (some? phase) (str phase) "?")
+                       (if (seq jobs) (name (:runtime (first jobs)))
+                           (if declared-runtime (name declared-runtime) "-"))
+                       (count jobs) (jobs-duration busy-ms)
+                       (jobs-duration pre-ms) (jobs-duration gaps-ms)
+                       (jobs-duration post-ms) (jobs-duration idle-ms))))
+    (when (seq ordered)
       (let [critical (last (sort-by (juxt :finish :id) completed))]
         (println)
-        (println "Last completed:" (:id critical)
-                 "[" (jobs-duration (:duration-ms critical)) "]"))
-      (when-not summary?
-        (println)
-        (println "PER-SLOT JOB DETAILS  (use --summary to hide this section)")
-        (println (apply str (repeat 78 "=")))
-        (doseq [[idx {:keys [identity jobs processes]}] (map-indexed vector slots)]
-          (let [label (timeline-slot-label identity (inc idx))
-                overlaps (count (filter (fn [[a b]] (.isBefore ^Instant (:start b) (:finish a)))
-                                        (partition 2 1 jobs)))]
-            (println (format "%s  |  %d job(s)  |  %d process(es)"
-                             label (count jobs) (count processes)))
-            (when (pos? overlaps)
-              (println "  WARNING: overlapping job intervals on this clone slot:" overlaps))
-            (loop [prior nil [proc & rest-procs] (seq processes)]
-              (when proc
-                (let [{:keys [worker-id runtime phase jobs]} proc
-                      start (:start (first jobs))
-                      handoff-gap (when prior
-                                    (max 0 (timeline-elapsed-ms
-                                            (reduce (fn [latest {:keys [finish]}]
-                                                      (if (.isAfter ^Instant finish latest) finish latest))
-                                                    (:finish (first (:jobs prior)))
-                                                    (rest (:jobs prior)))
-                                            start)))]
-                  (when prior
-                    (println "  HANDOFF / between-process gap:"
-                             (jobs-duration handoff-gap)))
-                  (println (format "  Phase %s | runtime %s | worker-process UUID %s"
-                                   (if (some? phase) (str phase) "unknown")
-                                   (name runtime) worker-id))
-                  (println "  START     GAP       ACTUAL    ESTIMATE   STATUS       JOB")
-                  (loop [prior-job nil [task & more] (seq jobs)]
-                    (when task
-                      (let [gap (when prior-job
-                                  (timeline-elapsed-ms (:finish prior-job) (:start task)))
-                            gap-label (cond
-                                        (nil? gap) "-"
-                                        (neg? gap) (str "OVERLAP " (jobs-duration (- gap)))
-                                        :else (jobs-duration gap))]
-                        (println (format "  +%-8s %-9s %-9s %-10s %-12s %s"
-                                         (jobs-duration (timeline-elapsed-ms origin (:start task)))
-                                         gap-label
-                                         (jobs-duration (:duration-ms task))
-                                         (jobs-duration (get estimates (:id task)))
-                                         (name (:status task)) (:id task)))
-                        (recur task more))))
-                  (recur proc rest-procs))))
-            (println)))))
-    (when-not (seq completed)
-      (println "No completed worker intervals available (run may still be starting)."))
+        (println "Last completed job:" (:id critical)
+                 "[" (jobs-duration (:duration-ms critical)) "]")))
+    (when-not summary?
+      (println)
+      (println "PER-SHARD JOB DETAILS (use --summary to omit this section)")
+      (println (apply str (repeat 92 "=")))
+      (doseq [{:keys [worker-id slot phase jobs measured-loop? pre-ms
+                      post-ms idle-ms]} shards]
+        (println (format "Shard %s | slot %s | phase %s | %d job(s)"
+                         worker-id (if slot (str "S" slot) "unmapped")
+                         (if (some? phase) (str phase) "unknown")
+                         (count jobs)))
+        (println (str "  Claim-loop idle: " (jobs-duration idle-ms)
+                      " (pre " (jobs-duration pre-ms)
+                      ", post " (jobs-duration post-ms) ")"
+                      (when-not measured-loop? " — lifecycle not recorded")))
+        (println "  START      GAP       ACTUAL    ESTIMATE   STATUS       JOB")
+        (loop [prior nil [task & more] (seq jobs)]
+          (when task
+            (let [gap (when prior (timeline-elapsed-ms (:finish prior) (:start task)))
+                  gap-label (cond (nil? gap) "-"
+                                  (neg? gap) (str "OVERLAP " (jobs-duration (- gap)))
+                                  :else (jobs-duration gap))]
+              (println (format "  +%-9s %-9s %-9s %-10s %-12s %s"
+                               (if origin (jobs-duration (timeline-elapsed-ms origin (:start task))) "-")
+                               gap-label (jobs-duration (:duration-ms task))
+                               (jobs-duration (get estimates (:id task)))
+                               (name (:status task)) (:id task)))
+              (recur task more))))
+        (println)))
     (when (pos? missing)
       (println "INCOMPLETE OBSERVATION:" missing
-               "jobs have no completed worker interval; no times inferred"))
+               "jobs have no completed receipt; no execution times inferred."))
     (flush)
     (when-not (= :pass (:overall report)) (System/exit 1))))
 
@@ -816,9 +829,9 @@
            "  explain    Explain failed or incomplete jobs using Shard diagnostics."
            "  jobs       List 20 slowest completed jobs by default; --all lists all;"
            "             --sort duration (default) or error (absolute estimate delta)."
-           "  timeline   Group observed processes by stable clone slot and handoff phase;"
-           "             show busy time, gaps, idle tails and per-process UUIDs."
-           "             --summary shows only the overview and slot-load table."
+           "  timeline   Show actual shard processes by UUID, with workspace slot/phase;"
+           "             job execution, gaps and measured claim-loop idle."
+           "             --summary shows only the overview and per-shard load table."
            ""
            "Options and paths:"
            "  ROOT       Repository/ZFS dataset root (default: current directory)."
