@@ -1431,8 +1431,8 @@
       (println "Observed execution (from" jobs "completed receipts):")
       (println "  Job window:" (human-duration job-window-ms)
                "(first job start to last completion; excludes setup/cleanup)")
-      (println "  Worker activity: busy=sum of job durations; gaps=idle within")
-      (println "  each worker's first-to-last job span; tail=until last job completes")
+      (println "  Worker activity (busy = sum of jobs, gaps = between jobs, tail = to run end):")
+      (println "  WORKER   JOBS        BUSY       GAPS       TAIL")
       (doseq [{:keys [worker-id jobs busy-ms idle-within-ms idle-tail-ms]}
               workers]
         (println (format "  Worker %-8s jobs %3d  busy %9s  gaps %9s  tail %9s"
@@ -1484,7 +1484,10 @@
                                  (assoc :signal (re-find #"signal=SIG[A-Z]+" line)))
                                (cond-> (and (not (:cause state))
                                             (re-find #"(?:Caused by:|chromium-launch-failed)" line))
-                                 (assoc :cause trimmed)))]
+                                 (assoc :cause trimmed))
+                               (cond-> (and (not (:fatal state))
+                                            (re-find #"(?:FATAL:|Socket path too long:)" line))
+                                 (assoc :fatal trimmed)))]
                  (cond
                    event?
                    (if (< (count events) 2000)
@@ -1499,7 +1502,7 @@
                      (update-in [:events (dec (count events)) :details]
                                 conj (str "line " (inc n) ": " trimmed)))
                    :else state)))
-             {:events [] :remaining 0 :omitted 0 :tail [] :cause nil :signal nil}
+             {:events [] :remaining 0 :omitted 0 :tail [] :cause nil :fatal nil :signal nil}
              (map-indexed vector (line-seq reader)))]
         found))))
 
@@ -1510,14 +1513,16 @@
   (let [bad (filterv #(not= :passed (:status %)) (:jobs report))]
     (println)
     (println "YGG EXPLAIN" (count bad) "unsuccessful job(s)")
+    (println (apply str (repeat 72 "-")))
     (doseq [[index {:keys [id status log blocked-by]}] (map-indexed vector bad)]
       (println (str " " (inc index) ". " id " [" (name status) "]"))
       (when (seq blocked-by)
         (println "    Blocked by:" (str/join ", " blocked-by)))
       (if-not log
         (println "    No completed job log (no result receipt)")
-        (let [{:keys [events omitted tail cause signal]} (explain-log run log)]
+        (let [{:keys [events omitted tail cause fatal signal]} (explain-log run log)]
           (println "    Log:" log)
+          (when fatal (println "    Fatal diagnostic:" fatal))
           (if (seq events)
             (do
               (println "    Failure entries:" (+ (count events) omitted))
@@ -1539,16 +1544,29 @@
 
 (defn- print-report! [report run]
   (println "SHARD REPORT" (name (:overall report)))
-  (println "Jobs:" (:total report) "Completed:" (:completed report))
-  (doseq [status report-status-order]
-    (println (format "  %-24s %d" (name status) (get-in report [:counts status]))))
+  (println (apply str (repeat 72 "=")))
+  (println "Run:     " (.getName (io/file run)))
+  (println (format "Jobs:     %d/%d completed  |  %d passed  |  %d unsuccessful"
+                   (:completed report) (:total report)
+                   (get-in report [:counts :passed])
+                   (- (:total report) (get-in report [:counts :passed]))))
+  (println)
+  (println "OUTCOMES")
+  (doseq [status report-status-order
+          :let [n (get-in report [:counts status])]
+          :when (or (not= :pass (:overall report)) (pos? n))]
+    (println (format "  %-24s %d" (name status) n)))
   (when-not (= :pass (:overall report))
     (explain-report! run report))
+  (println)
+  (println "EXECUTION")
   (print-observed-summary! report)
   (when-let [{:keys [eligible measured missing invalid totals-ms slowest]}
              (:jvm-timing report)]
     (when (pos? eligible)
-      (println "JVM timing (advisory; passed namespace jobs):"
+      (println)
+      (println "JVM TIMING  (advisory; passed namespace jobs)")
+      (println "  Coverage:"
                measured "/" eligible "measured;"
                (count missing) "missing;" (count invalid) "invalid")
       (println "  Summed job ms: wall" (:wall-ms totals-ms)
