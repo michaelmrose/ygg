@@ -240,6 +240,82 @@
         (is (= :timed-out (get-in outcomes ["d-timeout" :status])))
         (is (= :passed (get-in outcomes ["e-after" :status])))))))
 
+(defn- seed-explain-result!
+  "A validated immutable receipt fixture; no sandbox process is needed to
+  test a read-only reporter. Worker execution has separate regression tests."
+  [fx id status contents & [blocked-by]]
+  (let [run (:run fx)
+        manifest (read-manifest fx)
+        result (cond-> {:format :shard/job-result :version 1
+                        :inventory-sha256 (:inventory-sha256 manifest)
+                        :id id :runtime :jvm
+                        :worker-id "report-test-worker"
+                        :started-at "2026-10-28T00:00:00Z"
+                        :completed-at "2026-10-28T00:00:01Z"
+                        :log (str "logs/" id ".log")
+                        :status status
+                        :exit-code (case status :passed 0 :failed 2 nil)
+                        :duration-ms 1000}
+                 (= status :blocked) (assoc :blocked-by blocked-by))]
+    (.mkdir (file run "claims" id))
+    (spit (file run "logs" (str id ".log")) contents)
+    (spit (file run "results" (str id ".edn")) (pr-str result))))
+
+(deftest explain-enumerates-log-failures-and-runs-automatically
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx
+                  [(job "alpha" ["bash" "-c" "exit 2"])
+                   (job "beta" ["bash" "-c" "exit 3"])
+                   (job "gamma" ["bash" "-c" "exit 4"] ["alpha"])
+                   (job "good" ["bash" "-c" "true"])])
+      (seed-explain-result! fx "alpha" :failed
+                            (str "ERROR in (first-case) (file.clj:12)\n"
+                                 "  actual: Chromium launch failed\n"
+                                 "Caused by: TargetClosedError\n"
+                                 "  signal=SIGTRAP\n"
+                                 "ERROR in (second-case) (file.clj:15)\n"
+                                 "  actual: Chromium launch failed\n"))
+      (seed-explain-result! fx "beta" :failed "FAIL: assertion mismatch\n")
+      (seed-explain-result! fx "gamma" :blocked
+                            "Blocked by unsuccessful prerequisite(s): [alpha]\n"
+                            ["alpha"])
+      (seed-explain-result! fx "good" :passed "passed\n")
+      (let [r (invoke fx "explain" (str (:run fx)))
+            automatic (invoke fx "report" (str (:run fx)))
+            machine (report fx)]
+        (is (= 0 (:exit r)) (:out r))
+        (is (= 1 (:exit automatic)))
+        (is (= 1 (:exit machine)))
+        (is (= :fail (get-in machine [:edn :overall])))
+        (is (str/includes? (:out r) "YGG EXPLAIN 3 unsuccessful job(s)"))
+        (is (str/includes? (:out r) "1. alpha [failed]"))
+        (is (str/includes? (:out r) "2. beta [failed]"))
+        (is (str/includes? (:out r) "3. gamma [blocked]"))
+        (is (str/includes? (:out r) "Failure entries: 2"))
+        (is (str/includes? (:out r) "first-case"))
+        (is (str/includes? (:out r) "second-case"))
+        (is (str/includes? (:out r) "Blocked by: alpha"))
+        (is (str/includes? (:out r) "signal=SIGTRAP"))
+        (is (str/includes? (:out automatic) "YGG EXPLAIN"))
+        (is (not (str/includes? (:out automatic) "4. good")))
+        (is (not (str/includes? (:out machine) "YGG EXPLAIN")))))))
+
+(deftest explain-keeps-valid-results-and-symlink-safety
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx [(job "a" ["bash" "-c" "echo fine"])])
+      (seed-explain-result! fx "a" :passed "fine\n")
+      (let [r (invoke fx "explain" (str (:run fx)))]
+        (is (= 0 (:exit r)) (:out r))
+        (is (str/includes? (:out r) "0 unsuccessful job(s)")))
+      (let [log (file (:run fx) "logs" "a.log")]
+        (Files/delete (.toPath log))
+        (Files/createSymbolicLink (.toPath log)
+                                  (.toPath (file (:run fx) "jobs.edn")) attrs)
+        (is (= 2 (:exit (invoke fx "explain" (str (:run fx)))))
+            "Explain must not bypass validated receipt/log safety")))))
+
 (deftest timed-out-child-process-cannot-continue-running-in-workspace
   (with-fixture
     (fn [fx]
