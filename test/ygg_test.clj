@@ -406,6 +406,56 @@
             (is (empty? (mutation-calls fx)))
             (is (not (exists? (legacy-lock fx))))))))))
 
+
+(deftest timeline-shows-stable-clone-slots-and-process-handoffs
+  (with-fixture
+    (fn [fx]
+      (let [run (path (:root fx) ".ygg" "runs" "run-slot-fixture")
+            worker-a "11111111-1111-1111-1111-111111111111"
+            worker-b "22222222-2222-2222-2222-222222222222"
+            worker-c "33333333-3333-3333-3333-333333333333"
+            entry (fn [id runtime worker started finished duration]
+                    {:id id :status :passed :runtime runtime :worker-id worker
+                     :started-at started :completed-at finished :duration-ms duration})
+            jobs [(entry "first" :gesso worker-a
+                         "2026-01-01T00:00:00Z" "2026-01-01T00:00:10Z" 10000)
+                  (entry "second" :gesso-jvm worker-b
+                         "2026-01-01T00:00:15Z" "2026-01-01T00:00:30Z" 15000)
+                  (entry "third" :gesso-jvm worker-c
+                         "2026-01-01T00:00:03Z" "2026-01-01T00:00:23Z" 20000)]
+            report {:format :shard/report :version 1
+                    :inventory-sha256 "timeline-test"
+                    :overall :pass :total 3 :jobs jobs}]
+        (.mkdirs (path run "logs"))
+        (spit (path run "jobs.edn") "{}\n")
+        (write-executable! (path (:bin fx) "shard")
+                           (str "#!/bin/sh\nprintf '%s\\n' '"
+                                (pr-str report) "'\n"))
+        (spit (path run "worker-1.log")
+              (str "SHARD WORKER " worker-a " runtime :gesso jobs 1\n"))
+        (spit (path run "worker-1-phase-1.log")
+              (str "SHARD WORKER " worker-b " runtime :gesso-jvm jobs 1\n"))
+        (spit (path run "worker-2.log")
+              (str "SHARD WORKER " worker-c " runtime :gesso-jvm jobs 1\n"))
+        (let [full (successful! (run-ygg fx "timeline" "--run" "run-slot-fixture"))
+              text (:out full)
+              summary (successful! (run-ygg fx "timeline" "--summary"
+                                            "--run" "run-slot-fixture"))]
+          (is (str/includes? text "Clone slots observed: 2"))
+          (is (re-find #"S1\s+2\s+2\s+0ms\s+30\.0s\s+25\.0s\s+5\.0s\s+0ms" text))
+          (is (str/includes? text "HANDOFF / between-process gap: 5.0s"))
+          (is (str/includes? text (str "Phase 1 | runtime gesso-jvm | worker-process UUID " worker-b)))
+          (is (not (str/includes? (:out summary) "PER-SLOT JOB DETAILS")))
+          (is (str/includes? (:out summary) "Clone slots observed: 2")))
+        ;; A missing worker log must NOT cause two process UUIDs to be merged
+        ;; by observed timing or falsely assigned to an apparent physical slot.
+        (Files/delete (.toPath (path run "worker-1-phase-1.log")))
+        (let [unknown (successful! (run-ygg fx "timeline" "--summary"
+                                            "--run" "run-slot-fixture"))]
+          (is (str/includes? (:out unknown) "UNMAPPED: 1"))
+          (is (str/includes? (:out unknown) "Clone slots observed: 2"))
+          (is (str/includes? (:out unknown) "unmapped 22222222")))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'ygg-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
