@@ -25,6 +25,53 @@
         '[java.time.format DateTimeFormatter]
         '[java.util UUID])
 
+
+;; Presentation only. Never put ANSI codes or Unicode glyphs in EDN receipts.
+;; Force modes are useful when piping through a pager or testing captured output.
+(def ^:private display-mode (atom {}))
+(defn- interactive-output? []
+  (and (some? (System/console))
+       (not= "dumb" (System/getenv "TERM"))))
+(defn- display-setting [kind]
+  (or (get @display-mode kind)
+      (System/getenv (if (= kind :color) "YGG_COLOR" "YGG_UNICODE"))
+      "auto"))
+(defn- utf8-locale? []
+  (boolean (re-find #"(?i)(utf-?8)"
+                    (or (System/getenv "LC_ALL")
+                        (System/getenv "LC_CTYPE")
+                        (System/getenv "LANG") ""))))
+(defn- color-output? []
+  (case (display-setting :color)
+    "always" true
+    "never" false
+    (and (nil? (System/getenv "NO_COLOR"))
+         (interactive-output?))))
+(defn- unicode-output? []
+  (case (display-setting :unicode)
+    "always" true
+    "never" false
+    (and (interactive-output?) (utf8-locale?))))
+(def ^:private ansi-palette
+  {:title "\u001b[1;36m" :heading "\u001b[1;34m"
+   :pass "\u001b[32m" :fail "\u001b[1;31m"
+   :warn "\u001b[33m" :dim "\u001b[2m" :accent "\u001b[36m"})
+(defn- tint [kind value]
+  (let [value (str value)]
+    (if (and (color-output?) (get ansi-palette kind))
+      (str (get ansi-palette kind) value "\u001b[0m") value)))
+(defn- glyph [unicode ascii] (if (unicode-output?) unicode ascii))
+(defn- divider-line [length]
+  (apply str (repeat length (glyph "─" "-"))))
+(defn- outcome-style [status]
+  (case status
+    (:pass :passed) :pass
+    (:fail :failed :timed-out :execution-error) :fail
+    (:incomplete :blocked :waiting :claimed-without-result) :warn
+    :dim))
+(defn- outcome-text [status]
+  (tint (outcome-style status) (name status)))
+
 (def ^:private state-file ".ygg-state.edn")
 (def ^:private no-follow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
 (def ^:private safe-dataset #"[A-Za-z0-9][A-Za-z0-9_.:-]*(/[A-Za-z0-9][A-Za-z0-9_.:-]*)*")
@@ -302,10 +349,12 @@
     (if as-edn?
       (println (pr-str status))
       (if (= :idle (:status status))
-        (println "No recorded Ygg run")
-        (do (println "Origin snapshot:" (:snapshot status) "(retained on clean)")
+        (println (tint :warn "No recorded Ygg run"))
+        (do (println (tint :heading "Origin snapshot:") (:snapshot status) "(retained on clean)")
             (doseq [clone (:clones status)]
-              (println (:dataset clone) "->" (:mountpoint clone) "[verified mounted]")))))))
+              (println (tint :accent (:dataset clone)) (glyph "→" "->")
+                       (:mountpoint clone) (tint :pass (str (glyph "●" "[verified]")
+                                                               (when (unicode-output?) " mounted"))))))))))
 
 ;; Live run output is a read-only operation: no ZFS command, sudo, FileChannel
 ;; lock, or mutable job receipt is involved. The authoritative logs and manifest
@@ -441,7 +490,7 @@
                     (if (= b 10)
                       (let [line (String. (.toByteArray pending)
                                           StandardCharsets/UTF_8)]
-                        (println (str "[" label "] "
+                        (println (str (tint :accent (str "[" label "]")) " "
                                       (str/replace line #"\r$" "")))
                         (.reset pending))
                       (.write pending b))))
@@ -454,7 +503,7 @@
 (defn- tail! [root {:keys [run mode once?]}]
   (let [selected (tail-run! root run)
         mode (or mode :jvm)]
-    (println "YGG TAIL" (str selected) "mode" (name mode)
+    (println (tint :title "YGG TAIL") (str selected) "mode" (name mode)
              (if once? "snapshot" "following (Ctrl-C to stop)"))
     (flush)
     (loop [known {}, first-scan? true]
@@ -478,12 +527,20 @@
 ;; command selects a safely published run without ZFS privileges/locks, then
 ;; transparently forwards stdout, stderr and the reporter's exit status.
 ;; It neither reads nor changes result receipts itself.
+(defn- shard-process [command]
+  (let [pb (doto (ProcessBuilder. ^java.util.List command) (.inheritIO))
+        environment (.environment pb)]
+    (when-let [color (:color @display-mode)]
+      (.put environment "YGG_COLOR" color))
+    (when-let [unicode (:unicode @display-mode)]
+      (.put environment "YGG_UNICODE" unicode))
+    (.start pb)))
+
 (defn- report! [root {:keys [run edn?]}]
   (let [selected (tail-run! root run)
         command (cond-> ["shard" "report" (str selected)]
                   edn? (conj "--edn"))
-        process (.start (doto (ProcessBuilder. ^java.util.List command)
-                          (.inheritIO)))
+        process (shard-process command)
         exit (.waitFor process)]
     (when-not (zero? exit)
       (System/exit exit))))
@@ -493,9 +550,7 @@
 ;; Never derive success from the exit code alone or read unvalidated receipts.
 (defn- explain! [root {:keys [run]}]
   (let [selected (tail-run! root run)
-        process (.start (doto (ProcessBuilder. ^java.util.List
-                                               ["shard" "explain" (str selected)])
-                          (.inheritIO)))
+        process (shard-process ["shard" "explain" (str selected)])
         exit (.waitFor process)]
     (when-not (zero? exit)
       (System/exit exit))))
@@ -569,22 +624,24 @@
                              (- (or duration-ms 0)) id]))
                         (if all? entries actual))
         displayed (if all? sorted (take 20 sorted))]
-    (println "YGG JOBS" (name (:overall report))
+    (println (tint :title "YGG JOBS") (outcome-text (:overall report))
              "run" (str (.getFileName selected)))
     (println "Measured:" (count actual) "/" (:total report)
              "| order:" (if (= sort :error) "estimate error" "actual duration")
              "| showing:" (count displayed))
-    (println "ACTUAL      ESTIMATE    DELTA       WORKER    STATUS         JOB")
+    (println (tint :heading "ACTUAL      ESTIMATE    DELTA       WORKER    STATUS         JOB"))
     (doseq [{:keys [id duration-ms estimate error worker-id status]} displayed]
-      (println (format "%-11s %-11s %-11s %-9s %-14s %s"
+      (println (format "%-11s %-11s %-11s %-9s %s %s"
                        (jobs-duration duration-ms)
                        (jobs-duration estimate)
-                       (if (nil? error) "-"
-                           (str (if (neg? error) "-" "+")
-                                (jobs-duration (Math/abs (long error)))))
+                       (tint (if (and error (pos? error)) :warn :pass)
+                             (format "%-11s"
+                                     (if (nil? error) "-"
+                                         (str (if (neg? error) "-" "+")
+                                              (jobs-duration (Math/abs (long error)))))))
                        (if worker-id
                          (subs worker-id 0 (min 8 (count worker-id))) "-")
-                       (name status) id)))
+                       (tint (outcome-style status) (format "%-14s" (name status))) id)))
     (when (< (count actual) (:total report))
       (println "INCOMPLETE: jobs without validated receipts have no measured duration"))
     (when (empty? estimates)
@@ -618,8 +675,10 @@
                                    (and (< (timeline-elapsed-ms origin started) hi)
                                         (> (timeline-elapsed-ms origin finished) lo)))]]
              (cond
-               (some (fn [{:keys [start finish]}] (overlaps? start finish)) jobs) "#"
-               (and measured-loop? (overlaps? loop-start loop-end)) ":"
+               (some (fn [{:keys [start finish]}] (overlaps? start finish)) jobs)
+               (tint :pass (glyph "█" "#"))
+               (and measured-loop? (overlaps? loop-start loop-end))
+               (tint :warn (glyph "░" ":"))
                :else " ")))))
 
 (defn- timeline-shard-logs [run]
@@ -716,9 +775,9 @@
         unmapped (count (filter #(nil? (:slot %)) shards))
         unmeasured (count (remove :measured-loop? shards))
         missing (- (:total report) (count completed))]
-    (println "YGG TIMELINE" (name (:overall report))
+    (println (tint :title "YGG TIMELINE") (outcome-text (:overall report))
              "run" (str (.getFileName selected)))
-    (println (apply str (repeat 92 "=")))
+    (println (tint :dim (divider-line 92)))
     (println (format "Jobs: %d/%d  |  Actual shard processes: %d  |  Job window: %s"
                      (count completed) (:total report) (count shards)
                      (if origin (jobs-duration (timeline-elapsed-ms origin end)) "-")))
@@ -735,7 +794,8 @@
     (when origin
       (let [width 48]
         (println)
-        (println "SHARD JOB EXECUTION: # running job, : admitted claim-loop without job, blank otherwise")
+        (println "SHARD JOB EXECUTION:" (tint :pass (glyph "█" "#")) "running job,"
+                 (tint :warn (glyph "░" ":")) "idle within recorded claim-loop, blank otherwise")
         (println (format "%-15s %s  %s" "Shard" "0s"
                          (jobs-duration (timeline-elapsed-ms origin end))))
         (doseq [{:keys [worker-id slot phase] :as shard} shards]
@@ -744,12 +804,12 @@
                            (timeline-worker-bar origin end shard width)
                            (or slot "?") (or phase "?"))))))
     (println)
-    (println "SHARD     SLOT PHASE RUNTIME          JOBS BUSY      PRE       GAPS      POST      IDLE")
-    (println (apply str (repeat 92 "-")))
+    (println (tint :heading "SHARD     SLOT PHASE RUNTIME          JOBS BUSY      PRE       GAPS      POST      IDLE"))
+    (println (tint :dim (divider-line 92)))
     (doseq [{:keys [worker-id slot phase declared-runtime jobs busy-ms pre-ms gaps-ms post-ms
                     idle-ms]} shards]
-      (println (format "%-9s %-4s %-5s %-16s %4d %-9s %-9s %-9s %-9s %s"
-                       (subs worker-id 0 8)
+      (println (format "%s %-4s %-5s %-16s %4d %-9s %-9s %-9s %-9s %s"
+                       (tint :accent (format "%-9s" (subs worker-id 0 8)))
                        (if slot (str "S" slot) "?")
                        (if (some? phase) (str phase) "?")
                        (if (seq jobs) (name (:runtime (first jobs)))
@@ -760,23 +820,23 @@
     (when (seq ordered)
       (let [critical (last (sort-by (juxt :finish :id) completed))]
         (println)
-        (println "Last completed job:" (:id critical)
+        (println (tint :heading "Last completed job:") (:id critical)
                  "[" (jobs-duration (:duration-ms critical)) "]")))
     (when-not summary?
       (println)
-      (println "PER-SHARD JOB DETAILS (use --summary to omit this section)")
-      (println (apply str (repeat 92 "=")))
+      (println (tint :heading "PER-SHARD JOB DETAILS (use --summary to omit this section)"))
+      (println (tint :dim (divider-line 92)))
       (doseq [{:keys [worker-id slot phase jobs measured-loop? pre-ms
                       post-ms idle-ms]} shards]
-        (println (format "Shard %s | slot %s | phase %s | %d job(s)"
+        (println (tint :heading (format "Shard %s | slot %s | phase %s | %d job(s)"
                          worker-id (if slot (str "S" slot) "unmapped")
                          (if (some? phase) (str phase) "unknown")
-                         (count jobs)))
+                         (count jobs))))
         (println (str "  Claim-loop idle: " (jobs-duration idle-ms)
                       " (pre " (jobs-duration pre-ms)
                       ", post " (jobs-duration post-ms) ")"
                       (when-not measured-loop? " — lifecycle not recorded")))
-        (println "  START      GAP       ACTUAL    ESTIMATE   STATUS       JOB")
+        (println (tint :heading "  START      GAP       ACTUAL    ESTIMATE   STATUS       JOB"))
         (loop [prior nil [task & more] (seq jobs)]
           (when task
             (let [gap (when prior (timeline-elapsed-ms (:finish prior) (:start task)))
@@ -787,7 +847,7 @@
                                (if origin (jobs-duration (timeline-elapsed-ms origin (:start task))) "-")
                                gap-label (jobs-duration (:duration-ms task))
                                (jobs-duration (get estimates (:id task)))
-                               (name (:status task)) (:id task)))
+                               (outcome-text (:status task)) (:id task)))
               (recur task more))))
         (println)))
     (when (pos? missing)
@@ -812,6 +872,7 @@
            "  ygg explain [--run RUN] [ROOT]"
            "  ygg jobs [--all] [--sort duration|error] [--run RUN] [ROOT]"
            "  ygg timeline [--summary] [--run RUN] [ROOT]"
+           "  All human-readable views accept --color=auto|always|never and --unicode|--ascii."
            ""
            "Workspace commands:"
            "  create     Snapshot the root ZFS dataset and mount N verified clones"
@@ -840,6 +901,10 @@
            "  -n N       Clone count for create; other commands do not use -n."
            "  --edn      Available only for status and report."
            "  --summary  Compact timeline, without per-job listings."
+           "  --color=... auto (TTY default), always, never; NO_COLOR disables auto color."
+           "  --unicode   Force Unicode rules and block timelines (including pipes)."
+           "  --ascii     Force plain ASCII tables and timeline bars."
+           "  --no-color  Force ANSI off; --edn is always unstyled."
            "  --help,-h  Print this complete help; valid with any command."
            ""
            "Configuration and prerequisites:"
@@ -883,6 +948,14 @@
               (let [sort-key ({"duration" :duration "error" :error} (second xs))]
                 (when-not sort-key (fail! "--sort must be duration or error"))
                 (recur (nnext xs) (assoc parsed :sort sort-key))))
+          (re-matches #"--color=(auto|always|never)" x)
+          (recur (next xs) (assoc parsed :color (subs x 8)))
+          (= "--no-color" x)
+          (recur (next xs) (assoc parsed :color "never"))
+          (= "--unicode" x)
+          (recur (next xs) (assoc parsed :unicode "always"))
+          (= "--ascii" x)
+          (recur (next xs) (assoc parsed :unicode "never"))
           (= "--summary" x)
           (do (when (:summary? parsed) (fail! "Duplicate --summary"))
               (recur (next xs) (assoc parsed :summary? true)))
@@ -944,6 +1017,7 @@
             (fail! ":zfs-command is no longer configurable for privileged safety"))
         action (or (:action cli) (:action config))
         n (or (:n cli) (:n config) 1)]
+    (reset! display-mode (select-keys cli [:color :unicode]))
     (when-not (.isDirectory (io/file root)) (fail! "Not a directory"))
     (when-not (#{:create :clean :status :tail :report :explain :jobs :timeline} action)
       (fail! "Specify create, clean, status, tail, report, explain, jobs, timeline or :action in ygg.edn"))
