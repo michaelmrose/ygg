@@ -1591,52 +1591,80 @@
 ;; remains the only claim authority. Runtime groups constrain possible steals.
 (def ^:private schedule-format :shard/schedule)
 
-(defn- worker-specs [clones jobs]
-  ;; Every distinct runtime needs at least one isolated worker; use remaining
-  ;; clone capacity in proportion to its *actual* job count. Round-robin used
-  ;; to split N clones evenly between 138 Gesso JVM namespaces and six
-  ;; subprocess gates, needlessly leaving half the JVM parallelism idle.
-  ;; Largest remainders are deterministic; never allocate a worker to an
-  ;; absent runtime or let multiple runtimes share one writable clone.
-  (let [frequency (frequencies (map :runtime jobs))
-        runtimes (vec (sort (keys frequency)))
-        n (count clones)
+(defn- runtime-load-profile [jobs estimated worker-count]
+  ;; Predict the load of K workers of one runtime using the same LPT policy
+  ;; as the published schedule.  Unlike job-count weighting, this accounts
+  ;; for a few expensive gates versus many cheap namespace jobs.
+  (let [ordered (sort-by (fn [{:keys [id]}] [(- (estimated id)) id]) jobs)]
+    (mapv (fn [n]
+            (let [loads (reduce (fn [loads {:keys [id]}]
+                                  (let [target (first (sort-by (fn [i] [(loads i) i])
+                                                               (range n)))]
+                                    (update loads target + (estimated id))))
+                                (vec (repeat n 0)) ordered)]
+              {:maximum (apply max 0 loads)
+               :squared (reduce + 0N (map #(*' % %) loads))}))
+          (range 1 (inc worker-count)))))
+
+(defn- runtime-worker-quotas [jobs estimated worker-count]
+  ;; Dynamic programming over every feasible worker allocation, not a
+  ;; percentage of job counts and not a Gesso-specific fixed quota.  Keep a
+  ;; Pareto frontier keyed by [workers-used, predicted-max-runtime-load]; for
+  ;; each such point retain the smallest sum of squared worker loads.  This
+  ;; avoids exponential enumeration even for many runtimes/workspaces.
+  (let [by-runtime (group-by :runtime jobs)
+        runtimes (vec (sort (keys by-runtime)))
         groups (count runtimes)]
-    (require! (<= groups n)
-              "More runtime groups than isolated workspaces")
     (require! (pos? groups) "Cannot allocate workers without jobs")
-    (let [extra (- n groups)
-          total (reduce + (vals frequency))
-          allocation (mapv (fn [runtime]
-                             (let [weighted (*' extra (frequency runtime))]
-                               {:runtime runtime
-                                :base (inc (quot weighted total))
-                                :remainder (mod weighted total)
-                                :weight (frequency runtime)}))
-                           runtimes)
-          missing (- n (reduce + (map :base allocation)))
-          bonus (set (map :runtime
-                          (take missing
-                                (sort-by (fn [{:keys [runtime remainder weight]}]
-                                           [(- remainder) (- weight) (str runtime)])
-                                         allocation))))
-          quotas (into {} (map (fn [{:keys [runtime base]}]
-                                 [runtime (+ base (if (contains? bonus runtime) 1 0))])
-                               allocation))
-          ;; Distribute the runtime groups through the clone list; the
-          ;; schedule remains a preference, not ownership of any job.
-          ordered (loop [remaining quotas, assigned []]
-                    (if (= n (count assigned))
-                      assigned
-                      (let [round (filterv #(pos? (get remaining % 0)) runtimes)]
-                        (recur (reduce #(update %1 %2 dec) remaining round)
-                               (into assigned round)))))]
-      (require! (= n (count ordered)) "Worker allocation did not fill clones")
-      (mapv (fn [i clone]
-              {:index (inc i)
-               :workspace (:mountpoint clone)
-               :runtime (nth ordered i)})
-            (range n) clones))))
+    (require! (<= groups worker-count)
+              "More runtime groups than isolated workspaces")
+    (let [profiles (mapv #(runtime-load-profile (by-runtime %) estimated worker-count)
+                         runtimes)
+          states (reduce
+                  (fn [states profile]
+                    (reduce-kv
+                     (fn [next [used current-max] {:keys [squared quotas]}]
+                       (reduce (fn [acc n]
+                                 (let [{:keys [maximum] :as candidate} (nth profile (dec n))
+                                       key [(+ used n) (max current-max maximum)]
+                                       replacement {:squared (+ squared (:squared candidate))
+                                                    :quotas (conj quotas n)}
+                                       prior (get acc key)]
+                                   (if (or (nil? prior)
+                                           (neg? (compare [(:squared replacement)
+                                                           (:quotas replacement)]
+                                                          [(:squared prior) (:quotas prior)])))
+                                     (assoc acc key replacement)
+                                     acc)))
+                               next (range 1 (inc (- worker-count used)))))
+                     {} states))
+                  {[0 0] {:squared 0N :quotas []}}
+                  profiles)
+          chosen (->> states
+                      (filter (fn [[[used _] _]] (= worker-count used)))
+                      (sort-by (fn [[[used maximum] {:keys [squared quotas]}]]
+                                 [maximum squared quotas]))
+                      first second)]
+      (require! (some? chosen) "Worker allocation did not fill clones")
+      (zipmap runtimes (:quotas chosen)))))
+
+(defn- worker-specs [clones jobs estimated]
+  (let [runtimes (vec (sort (set (map :runtime jobs))))
+        n (count clones)
+        quotas (runtime-worker-quotas jobs estimated n)
+        ;; Preserve deterministic interleaving and exclusive clone ownership.
+        ordered (loop [remaining quotas assigned []]
+                  (if (= n (count assigned))
+                    assigned
+                    (let [round (filterv #(pos? (get remaining % 0)) runtimes)]
+                      (recur (reduce #(update %1 %2 dec) remaining round)
+                             (into assigned round)))))]
+    (require! (= n (count ordered)) "Worker allocation did not fill clones")
+    (mapv (fn [i clone]
+            {:index (inc i)
+             :workspace (:mountpoint clone)
+             :runtime (nth ordered i)})
+          (range n) clones)))
 
 (defn- valid-queues? [queues specs jobs]
   (let [ids (mapcat identity queues)
@@ -1792,43 +1820,44 @@
                [id (long (Math/round (/ (double (reduce + durations))
                                          (count durations))))]))))
 
-(defn- prepare-schedule [root manifest specs]
-  (let [jobs (:jobs manifest)
-        history (vec (recent-run-data root))
+(defn- scheduling-data [root jobs]
+  (let [history (vec (recent-run-data root))
         observed (recent-duration-averages history (set (map :id jobs)))
-        ;; Missing jobs get a conservative median of other job estimates,
-        ;; never a timing copied from a failed launch or a scoped job's sole
-        ;; execution.  No observations at all preserves the 60s baseline.
         known (sort (vals observed))
         default-ms (if (seq known)
                      (max 1000 (nth known (quot (count known) 2)))
-                     60000)
-        estimated (into {} (for [{:keys [id]} jobs]
-                             [id (long (max 1 (get observed id default-ms)))]))
-        fresh (lpt-queues jobs specs estimated)
-        ;; A recent scoped run should not eclipse a still-compatible older
-        ;; full-run queue.  Warm-start only from validated compatible history.
-        previous (some (fn [{:keys [schedule] :as datum}]
-                         (when (and (= (count specs) (:worker-count schedule))
-                                    (= (mapv :runtime specs) (:runtimes schedule))
-                                    (valid-queues? (:queues schedule) specs jobs))
-                           datum))
-                       history)
-        warm (get-in previous [:schedule :queues])
-        initial (if (and warm
-                         (not (pos? (compare (score-queues warm estimated)
-                                             (score-queues fresh estimated)))))
-                  warm fresh)
-        origin (if (= initial warm) :warm-start :lpt)
-        improved (improve-queues initial specs estimated)]
-    {:format schedule-format :version 1
-     :inventory-sha256 (:inventory-sha256 manifest)
-     :worker-count (count specs)
-     :runtimes (mapv :runtime specs)
-     :queues improved
-     :estimated-ms estimated
-     :estimated-makespan-ms (first (score-queues improved estimated))
-     :origin origin}))
+                     60000)]
+    {:history history
+     :estimated (into {} (for [{:keys [id]} jobs]
+                           [id (long (max 1 (get observed id default-ms)))]))}))
+
+(defn- prepare-schedule
+  ([root manifest specs]
+   (prepare-schedule root manifest specs (scheduling-data root (:jobs manifest))))
+  ([root manifest specs {:keys [history estimated]}]
+   (let [jobs (:jobs manifest)
+         fresh (lpt-queues jobs specs estimated)
+         ;; A scoped run cannot eclipse a compatible older full-run queue.
+         previous (some (fn [{:keys [schedule] :as datum}]
+                          (when (and (= (count specs) (:worker-count schedule))
+                                     (= (mapv :runtime specs) (:runtimes schedule))
+                                     (valid-queues? (:queues schedule) specs jobs))
+                            datum)) history)
+         warm (get-in previous [:schedule :queues])
+         initial (if (and warm
+                          (not (pos? (compare (score-queues warm estimated)
+                                              (score-queues fresh estimated)))))
+                   warm fresh)
+         origin (if (= initial warm) :warm-start :lpt)
+         improved (improve-queues initial specs estimated)]
+     {:format schedule-format :version 1
+      :inventory-sha256 (:inventory-sha256 manifest)
+      :worker-count (count specs)
+      :runtimes (mapv :runtime specs)
+      :queues improved
+      :estimated-ms estimated
+      :estimated-makespan-ms (first (score-queues improved estimated))
+      :origin origin})))
 
 (defn- write-schedule! [run schedule]
   ;; Published before starting any workers, under the ordinary run directory.
@@ -2111,33 +2140,44 @@
       (.destroyForcibly process)
       (.waitFor process 3 TimeUnit/SECONDS))))
 
-(defn- runtime-drained? [manifest results runtime]
-  ;; Reassignment is allowed only after EVERY job belonging to the exiting
-  ;; runtime has an immutable result, including failed and blocked jobs.
-  ;; Missing receipts/claimed-without-result must not cause a handoff.
-  (every? #(contains? results (:id %))
+(defn- runtime-work-fully-claimed? [run manifest results runtime]
+  ;; A finished worker may leave this runtime once every outstanding job has
+  ;; an immutable claim owned by some surviving worker. No future job can
+  ;; become unclaimed; dependencies can only unlock already-claimed jobs.
+  ;; The finished worker exited zero only after publishing its own results and
+  ;; tearing down its own JVM session / test process groups.
+  (every? (fn [{:keys [id]}]
+            (or (contains? results id)
+                (Files/isDirectory (.toPath (io/file run "claims" id))
+                                   session-no-follow)))
           (filter #(= runtime (:runtime %)) (:jobs manifest))))
 
-(defn- reassignment-target [run manifest results exiting-runtime]
-  ;; Pick the largest compatible unfinished group with at least one *ready*
-  ;; unclaimed job. Immutable claims are never transferred, retried or stolen.
-  ;; Even a blocked job is ready for its terminal :blocked result once its
-  ;; unsuccessful prerequisite has produced a result.
-  (let [available (for [{:keys [id runtime depends-on]} (:jobs manifest)
-                        :when (and (not= runtime exiting-runtime)
-                                   (not (contains? results id))
-                                   (not (.exists (io/file run "claims" id)))
-                                   (every? #(contains? results %) depends-on))]
-                    runtime)]
-    (->> available frequencies
-         (sort-by (fn [[runtime n]] [(- n) (str runtime)]))
+(defn- reassignment-target [run manifest results exiting-runtime estimated active]
+  ;; A handoff favors the runtime with the largest ready, unclaimed estimated
+  ;; backlog per worker AFTER adding this clone. Do not use raw job counts:
+  ;; one expensive browser gate may outweigh dozens of subsecond tests.
+  (let [ready (for [{:keys [id runtime depends-on] :as job} (:jobs manifest)
+                    :when (and (not= runtime exiting-runtime)
+                               (not (contains? results id))
+                               (not (.exists (io/file run "claims" id)))
+                               (every? #(contains? results %) depends-on))]
+                job)
+        by-runtime (group-by :runtime ready)
+        active-counts (frequencies (map :runtime (vals active)))]
+    (->> by-runtime
+         (sort-by (fn [[runtime jobs]]
+                    [(- (/ (double (reduce + 0 (map #(get estimated (:id %) 60000) jobs)))
+                           (inc (get active-counts runtime 0))))
+                     (str runtime)]))
          ffirst)))
 
 (defn- execute-workers! [run clones manifest admitted-head]
   (let [;; Exactly one concurrently running worker per writable clone.
         ;; A clone may be reused serially after the previous runtime's
         ;; receipts and process-group termination have been verified.
-        specs (worker-specs clones (:jobs manifest))
+        schedule (read-edn! (slurp (io/file run "schedule.edn"))
+                            "published schedule")
+        specs (worker-specs clones (:jobs manifest) (:estimated-ms schedule))
         script (script-command!)
         started (atom [])
         interrupted? (atom false)]
@@ -2155,10 +2195,10 @@
             ;; while a long-lived JVM worker continues testing.
             (loop [active active, exits [], phases (zipmap (map :index specs)
                                                             (repeat 0))
-                   ;; An early, successful worker exit does not forfeit its
-                   ;; clone. It may become eligible for handoff only AFTER
-                   ;; every job of its original runtime has a terminal
-                   ;; receipt and all sibling workers have exited.
+                    ;; A successful worker's clone can be reused when no
+                   ;; unclaimed work remains in its runtime. Its own sessions
+                   ;; have terminated; sibling workers may continue processing
+                   ;; their already-claimed jobs without losing ownership.
                    retired (sorted-map)]
               (if (empty? active)
                 (do
@@ -2204,16 +2244,20 @@
                           [next-active next-phases next-retired]
                           (reduce
                            (fn [[current phase-map idle] [index {:keys [runtime workspace]}]]
-                             (if (and (runtime-drained? manifest results runtime)
-                                      ;; The outgoing runtime must have no
-                                      ;; surviving workers before clone reuse.
-                                      (not-any? #(= runtime (:runtime %))
-                                                (vals current)))
-                               (if-let [target (reassignment-target run manifest results runtime)]
+                             (if (runtime-work-fully-claimed? run manifest results runtime)
+                               (if-let [target (reassignment-target run manifest results runtime
+                                                                    (:estimated-ms schedule)
+                                                                    current)]
                                  (do
                                    (assert-no-running-sessions!
                                     run (assoc manifest :jobs
-                                               (filterv #(= runtime (:runtime %))
+                                               ;; Check all TERMINAL jobs of the
+                                               ;; outgoing runtime. Live claimed
+                                               ;; jobs remain with other active
+                                               ;; workers, and their process
+                                               ;; groups are not this clone's.
+                                               (filterv #(and (= runtime (:runtime %))
+                                                              (contains? results (:id %)))
                                                         (:jobs manifest))))
                                    (let [phase (inc (get phase-map index 0))
                                          worker (start-worker! script run workspace
@@ -2317,8 +2361,9 @@
         virtual-clones (mapv (fn [i] {:mountpoint
                                       (str (io/file root ".ygg" "workers" (str i)))})
                              (range 1 (inc (:workers opts))))
-        specs (worker-specs virtual-clones (:jobs manifest))
-        schedule (prepare-schedule root manifest specs)]
+        data (scheduling-data root (:jobs manifest))
+        specs (worker-specs virtual-clones (:jobs manifest) (:estimated data))
+        schedule (prepare-schedule root manifest specs data)]
     {:inventory inventory :schedule schedule :job-count (count (:jobs manifest))}))
 
 (defn- preflight-once! [root head]
@@ -2394,7 +2439,8 @@
                     (let [status (ygg-status! root)
                           clones (checked-clones! root status (:workers opts) head)
                           manifest (inventory-manifest! root head status inventory)
-                          specs (worker-specs clones (:jobs manifest))
+                          specs (worker-specs clones (:jobs manifest)
+                                              (get-in preparation [:schedule :estimated-ms]))
                           ;; Source identity changes on snapshot creation;
                           ;; planning assignments and timings do not.
                           schedule (assoc (:schedule preparation)
