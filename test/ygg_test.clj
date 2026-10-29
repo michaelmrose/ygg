@@ -407,13 +407,14 @@
             (is (not (exists? (legacy-lock fx))))))))))
 
 
-(deftest timeline-shows-stable-clone-slots-and-process-handoffs
+(deftest timeline-reports-actual-shards-and-measures-only-their-own-idle
   (with-fixture
     (fn [fx]
       (let [run (path (:root fx) ".ygg" "runs" "run-slot-fixture")
             worker-a "11111111-1111-1111-1111-111111111111"
             worker-b "22222222-2222-2222-2222-222222222222"
             worker-c "33333333-3333-3333-3333-333333333333"
+            worker-d "44444444-4444-4444-4444-444444444444"
             entry (fn [id runtime worker started finished duration]
                     {:id id :status :passed :runtime runtime :worker-id worker
                      :started-at started :completed-at finished :duration-ms duration})
@@ -425,36 +426,60 @@
                          "2026-01-01T00:00:03Z" "2026-01-01T00:00:23Z" 20000)]
             report {:format :shard/report :version 1
                     :inventory-sha256 "timeline-test"
-                    :overall :pass :total 3 :jobs jobs}]
+                    :overall :pass :total 3 :jobs jobs}
+            worker-log (fn [uuid runtime start end]
+                         (str "SHARD WORKER " uuid " runtime " runtime " jobs 1\n"
+                              "SHARD WORKER LOOP START " uuid " " start "\n"
+                              "SHARD WORKER DONE " uuid "\n"
+                              "SHARD WORKER LOOP END " uuid " " end "\n"))]
         (.mkdirs (path run "logs"))
         (spit (path run "jobs.edn") "{}\n")
         (write-executable! (path (:bin fx) "shard")
                            (str "#!/bin/sh\nprintf '%s\\n' '"
                                 (pr-str report) "'\n"))
+        ;; The same ZFS slot S1 hosts two DIFFERENT shard processes. Its
+        ;; five-second handoff gap is idle time of NEITHER shard.
         (spit (path run "worker-1.log")
-              (str "SHARD WORKER " worker-a " runtime :gesso jobs 1\n"))
+              (worker-log worker-a ":gesso"
+                          "2025-12-31T23:59:59Z" "2026-01-01T00:00:11Z"))
         (spit (path run "worker-1-phase-1.log")
-              (str "SHARD WORKER " worker-b " runtime :gesso-jvm jobs 1\n"))
+              (worker-log worker-b ":gesso-jvm"
+                          "2026-01-01T00:00:14Z" "2026-01-01T00:00:31Z"))
         (spit (path run "worker-2.log")
-              (str "SHARD WORKER " worker-c " runtime :gesso-jvm jobs 1\n"))
+              (worker-log worker-c ":gesso-jvm"
+                          "2026-01-01T00:00:02Z" "2026-01-01T00:00:24Z"))
+        ;; Idle shard with zero jobs must still be visible when logged.
+        (spit (path run "worker-3.log")
+              (worker-log worker-d ":gesso-jvm"
+                          "2026-01-01T00:00:05Z" "2026-01-01T00:00:08Z"))
         (let [full (successful! (run-ygg fx "timeline" "--run" "run-slot-fixture"))
               text (:out full)
               summary (successful! (run-ygg fx "timeline" "--summary"
                                             "--run" "run-slot-fixture"))]
-          (is (str/includes? text "Clone slots observed: 2"))
-          (is (re-find #"S1\s+2\s+2\s+0ms\s+30\.0s\s+25\.0s\s+5\.0s\s+0ms" text))
-          (is (str/includes? text "HANDOFF / between-process gap: 5.0s"))
-          (is (str/includes? text (str "Phase 1 | runtime gesso-jvm | worker-process UUID " worker-b)))
-          (is (not (str/includes? (:out summary) "PER-SLOT JOB DETAILS")))
-          (is (str/includes? (:out summary) "Clone slots observed: 2")))
-        ;; A missing worker log must NOT cause two process UUIDs to be merged
-        ;; by observed timing or falsely assigned to an apparent physical slot.
+          (is (str/includes? text "Actual shard processes: 4"))
+          (is (str/includes? text "One row per actual executing shard UUID"))
+          (is (re-find #"11111111\s+S1\s+0\s+gesso\s+1\s+10\.0s\s+1\.0s\s+0ms\s+1\.0s\s+2\.0s" text))
+          (is (re-find #"22222222\s+S1\s+1\s+gesso-jvm\s+1\s+15\.0s\s+1\.0s\s+0ms\s+1\.0s\s+2\.0s" text))
+          (is (str/includes? text (str "Shard " worker-b " | slot S1 | phase 1")))
+          (is (re-find #"44444444\s+S3\s+0\s+gesso-jvm\s+0" text))
+          (is (str/includes? text "3.0s"))
+          (is (not (str/includes? text "HANDOFF / between-process gap")))
+          (is (not (str/includes? (:out summary) "PER-SHARD JOB DETAILS")))
+          (is (str/includes? (:out summary) "Actual shard processes: 4")))
+        ;; An older run has no claim-loop markers, so do not fabricate idle
+        ;; tails using the global run's last completion.
+        (spit (path run "worker-1-phase-1.log")
+              (str "SHARD WORKER " worker-b " runtime :gesso-jvm jobs 1\n"))
+        (let [old (successful! (run-ygg fx "timeline" "--summary"
+                                         "--run" "run-slot-fixture"))]
+          (is (str/includes? (:out old) "UNMEASURED IDLE: 1"))
+          (is (re-find #"22222222\s+S1\s+1\s+gesso-jvm\s+1\s+15\.0s\s+-\s+0ms\s+-\s+-" (:out old))))
+        ;; Missing metadata does NOT cause a false queue/slot assignment.
         (Files/delete (.toPath (path run "worker-1-phase-1.log")))
         (let [unknown (successful! (run-ygg fx "timeline" "--summary"
                                             "--run" "run-slot-fixture"))]
           (is (str/includes? (:out unknown) "UNMAPPED: 1"))
-          (is (str/includes? (:out unknown) "Clone slots observed: 2"))
-          (is (str/includes? (:out unknown) "unmapped 22222222")))))))
+          (is (re-find #"22222222\s+\?\s+\?" (:out unknown))))))))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'ygg-test)]
