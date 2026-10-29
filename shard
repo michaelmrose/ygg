@@ -47,6 +47,53 @@
   #{:identity :capabilities :execution :session-command})
 (def ^:private execution-modes #{:subprocess :persistent-jvm})
 
+
+;; Presentation only. Never put ANSI codes or Unicode glyphs in EDN receipts.
+;; Force modes are useful when piping through a pager or testing captured output.
+(def ^:private display-mode (atom {}))
+(defn- interactive-output? []
+  (and (some? (System/console))
+       (not= "dumb" (System/getenv "TERM"))))
+(defn- display-setting [kind]
+  (or (get @display-mode kind)
+      (System/getenv (if (= kind :color) "YGG_COLOR" "YGG_UNICODE"))
+      "auto"))
+(defn- utf8-locale? []
+  (boolean (re-find #"(?i)(utf-?8)"
+                    (or (System/getenv "LC_ALL")
+                        (System/getenv "LC_CTYPE")
+                        (System/getenv "LANG") ""))))
+(defn- color-output? []
+  (case (display-setting :color)
+    "always" true
+    "never" false
+    (and (nil? (System/getenv "NO_COLOR"))
+         (interactive-output?))))
+(defn- unicode-output? []
+  (case (display-setting :unicode)
+    "always" true
+    "never" false
+    (and (interactive-output?) (utf8-locale?))))
+(def ^:private ansi-palette
+  {:title "\u001b[1;36m" :heading "\u001b[1;34m"
+   :pass "\u001b[32m" :fail "\u001b[1;31m"
+   :warn "\u001b[33m" :dim "\u001b[2m" :accent "\u001b[36m"})
+(defn- tint [kind value]
+  (let [value (str value)]
+    (if (and (color-output?) (get ansi-palette kind))
+      (str (get ansi-palette kind) value "\u001b[0m") value)))
+(defn- glyph [unicode ascii] (if (unicode-output?) unicode ascii))
+(defn- divider-line [length]
+  (apply str (repeat length (glyph "─" "-"))))
+(defn- outcome-style [status]
+  (case status
+    (:pass :passed) :pass
+    (:fail :failed :timed-out :execution-error) :fail
+    (:incomplete :blocked :waiting :claimed-without-result) :warn
+    :dim))
+(defn- outcome-text [status]
+  (tint (outcome-style status) (name status)))
+
 (defn- fail! [message & [data]]
   (throw (ex-info message (or data {}))))
 
@@ -1438,18 +1485,18 @@
   (let [{:keys [jobs job-window-ms workers slowest]}
         (observed-job-summary report)]
     (when (pos? jobs)
-      (println "Observed execution (from" jobs "completed receipts):")
+      (println (tint :heading "Observed execution") "(from" jobs "completed receipts):")
       (println "  Job window:" (human-duration job-window-ms)
                "(first job start to last completion; excludes setup/cleanup)")
       (println "  SHARD processes (receipts only; gaps exclude first/last-job idle):")
-      (println "  SHARD     JOBS        BUSY       BETWEEN-JOB GAPS")
+      (println (tint :heading "  SHARD     JOBS        BUSY       BETWEEN-JOB GAPS"))
       (doseq [{:keys [worker-id jobs busy-ms idle-within-ms]}
               workers]
         (println (format "  Shard %-8s jobs %3d  busy %9s  gaps %9s"
                          (subs worker-id 0 (min 8 (count worker-id)))
                          jobs (human-duration busy-ms)
                          (human-duration idle-within-ms))))
-      (println "  Slowest completed jobs:")
+      (println (tint :heading "  Slowest completed jobs:"))
       (doseq [{:keys [id duration-ms worker-id status]} slowest]
         (println "   " (human-duration duration-ms) id
                  (str "[" (name status) ", worker "
@@ -1521,20 +1568,20 @@
   [run report]
   (let [bad (filterv #(not= :passed (:status %)) (:jobs report))]
     (println)
-    (println "YGG EXPLAIN" (count bad) "unsuccessful job(s)")
-    (println (apply str (repeat 72 "-")))
+    (println (tint :title "YGG EXPLAIN") (tint (if (seq bad) :fail :pass) (count bad)) "unsuccessful job(s)")
+    (println (tint :dim (divider-line 72)))
     (doseq [[index {:keys [id status log blocked-by]}] (map-indexed vector bad)]
-      (println (str " " (inc index) ". " id " [" (name status) "]"))
+      (println (str " " (inc index) (glyph " │ " ". ") id " [" (outcome-text status) "]"))
       (when (seq blocked-by)
         (println "    Blocked by:" (str/join ", " blocked-by)))
       (if-not log
         (println "    No completed job log (no result receipt)")
         (let [{:keys [events omitted tail cause fatal signal]} (explain-log run log)]
           (println "    Log:" log)
-          (when fatal (println "    Fatal diagnostic:" fatal))
+          (when fatal (println (tint :fail "    Fatal diagnostic:") (tint :fail fatal)))
           (if (seq events)
             (do
-              (println "    Failure entries:" (+ (count events) omitted))
+              (println (tint :warn "    Failure entries:") (+ (count events) omitted))
               (doseq [[i {:keys [line heading details]}] (map-indexed vector events)]
                 (println (str "      " (inc i) ") line " line ": " heading))
                 (doseq [detail details]
@@ -1546,35 +1593,36 @@
               (doseq [line tail :when (not (str/blank? line))]
                 (println "      " line))))
           (when cause (println "    Observed cause:" cause))
-          (when signal (println "    Process signal:" signal)))))
+          (when signal (println (tint :warn "    Process signal:") (tint :fail signal))))))
     (when (seq bad)
       (println "Full logs:" (str (io/file run "logs" "<job-id>.log"))))
     (flush)))
 
 (defn- print-report! [report run]
-  (println "SHARD REPORT" (name (:overall report)))
-  (println (apply str (repeat 72 "=")))
+  (println (tint :title "SHARD REPORT") (outcome-text (:overall report)))
+  (println (tint :dim (divider-line 72)))
   (println "Run:     " (.getName (io/file run)))
   (println (format "Jobs:     %d/%d completed  |  %d passed  |  %d unsuccessful"
                    (:completed report) (:total report)
                    (get-in report [:counts :passed])
                    (- (:total report) (get-in report [:counts :passed]))))
   (println)
-  (println "OUTCOMES")
+  (println (tint :heading "OUTCOMES"))
   (doseq [status report-status-order
           :let [n (get-in report [:counts status])]
           :when (or (not= :pass (:overall report)) (pos? n))]
-    (println (format "  %-24s %d" (name status) n)))
+    (println (format "  %s %d" (tint (outcome-style status)
+                                           (format "%-24s" (name status))) n)))
   (when-not (= :pass (:overall report))
     (explain-report! run report))
   (println)
-  (println "EXECUTION")
+  (println (tint :heading "EXECUTION"))
   (print-observed-summary! report)
   (when-let [{:keys [eligible measured missing invalid totals-ms slowest]}
              (:jvm-timing report)]
     (when (pos? eligible)
       (println)
-      (println "JVM TIMING  (advisory; passed namespace jobs)")
+      (println (tint :heading "JVM TIMING  (advisory; passed namespace jobs)"))
       (println "  Coverage:"
                measured "/" eligible "measured;"
                (count missing) "missing;" (count invalid) "invalid")
