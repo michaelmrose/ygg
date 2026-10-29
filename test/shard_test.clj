@@ -2724,61 +2724,50 @@ sys.exit(2)")
           (finally
             (reset! interrupted false)))))))
 
-;; v1175: Shard must inject --disable-gpu into real Playwright launches
-;; without adding uncommitted files to the source ZFS dataset.  The wrapper
-;; lives under a private worker root and only browser:integration opts in.
-(deftest browser-integration-uses-private-no-gpu-chromium-wrapper
-  (with-fixture
-    (fn [fx]
-      (let [embedded (persistent-shard-namespace!)
-            ns (-> (:worker embedded) meta :ns)
-            make-env (ns-resolve ns 'create-worker-environment!)
-            configure (ns-resolve ns 'configure-browser-gate!)
-            chrome (file (:base fx) "fake-chromium")
-            _ (spit chrome "#!/bin/sh\nprintf '%s\\n' \"$@\"\n")
-            _ (is (.setExecutable chrome true))
-            worker-env (make-env (:workspace fx) "gpu-wrapper-test")
-            selected (doto (java.util.HashMap.)
-                       (.put "GESSO_CHROMIUM" (.getAbsolutePath chrome)))
-            unchanged (doto (java.util.HashMap.)
-                        (.put "GESSO_CHROMIUM" (.getAbsolutePath chrome)))]
-        (is (every? some? [make-env configure]))
-        (configure {:gate :browser:integration} selected worker-env)
-        (let [wrapper (get selected "GESSO_CHROMIUM")]
-          (is (str/starts-with? wrapper (get worker-env "SHARD_WORKER_ENV_ROOT")))
-          (is (.canExecute (file wrapper)))
-          (is (= (.getAbsolutePath chrome) (get selected "SHARD_CHROMIUM_ORIGINAL")))
-          (let [result (exec! (:workspace fx) [wrapper "--headless" "about:blank"]
-                              {"SHARD_CHROMIUM_ORIGINAL" (get selected "SHARD_CHROMIUM_ORIGINAL")})]
-            (is (zero? (:exit result)) (:out result))
-            (is (= ["--disable-gpu" "--headless" "about:blank"]
-                   (str/split-lines (str/trim (:out result))))
-                (:out result)))
-          (is (not (.exists (file (:project fx) "chromium-no-gpu")))
-              "The source checkout must not acquire a browser wrapper"))
-        (configure {:gate :browser} unchanged worker-env)
-        (is (= (.getAbsolutePath chrome) (get unchanged "GESSO_CHROMIUM"))
-            "The direct Chromium gate keeps its existing command")
-        (is (nil? (get unchanged "SHARD_CHROMIUM_ORIGINAL")))
-        (let [without-override (java.util.HashMap.)]
-          (configure {:gate :browser:integration} without-override worker-env)
-          (is (.canExecute (file (get without-override "GESSO_CHROMIUM"))))
-          (is (nil? (get without-override "SHARD_CHROMIUM_ORIGINAL"))))))))
+;; v1177: Gesso's Chromium gates require a short *in-sandbox* TMPDIR.
+;; The real worker's clone-based TMPDIR can exceed the AF_UNIX sun_path limit
+;; once Chromium appends org.chromium.Chromium.*/SingletonSocket.  Using /tmp
+;; is safe because every job has a private Bubblewrap /tmp tmpfs.
+(deftest browser-gates-use-short-private-sandbox-tmp
+  (let [embedded (persistent-shard-namespace!)
+        ns (-> (:worker embedded) meta :ns)
+        configure (ns-resolve ns 'configure-browser-gate!)
+        java-options (ns-resolve ns 'java-tool-options-for-worker)
+        private-temp "/home/user/very/long/clone/.ygg/shard-worker-env/uuid/tmp"]
+    (is (every? some? [configure java-options]))
+    (doseq [gate [:browser :browser:integration]]
+      (let [env (doto (java.util.HashMap.)
+                  (.put "TMPDIR" private-temp)
+                  (.put "TMP" private-temp)
+                  (.put "TEMP" private-temp)
+                  (.put "GESSO_CHROMIUM" "/usr/bin/chromium"))]
+        (configure {:gate gate} env)
+        (is (= "/tmp" (.get env "TMPDIR")))
+        (is (= "/tmp" (.get env "TMP")))
+        (is (= "/tmp" (.get env "TEMP")))
+        (is (= "/usr/bin/chromium" (.get env "GESSO_CHROMIUM"))
+            "Preserve explicit Chromium executable; no GPU wrapper")
+        (is (str/includes? (java-options nil (.get env "TMPDIR") "/private/home")
+                           "-Djava.io.tmpdir=\"/tmp\""))))
+    (let [env (doto (java.util.HashMap.)
+                (.put "TMPDIR" private-temp)
+                (.put "TMP" private-temp)
+                (.put "TEMP" private-temp))]
+      (configure {:gate :jvm} env)
+      (is (= private-temp (.get env "TMPDIR")))
+      (is (= private-temp (.get env "TMP")))
+      (is (= private-temp (.get env "TEMP"))))))
 
-(deftest browser-wrapper-rejects-unverified-private-home
-  (with-fixture
-    (fn [fx]
-      (let [embedded (persistent-shard-namespace!)
-            configure (ns-resolve (-> (:worker embedded) meta :ns)
-                                  'configure-browser-gate!)
-            result (try
-                     (configure {:gate :browser:integration}
-                                (java.util.HashMap.)
-                                {"SHARD_WORKER_ENV_ROOT" "/does-not-exist"})
-                     nil
-                     (catch clojure.lang.ExceptionInfo ex ex))]
-        (is (instance? clojure.lang.ExceptionInfo result))
-        (is (str/includes? (.getMessage result) "verified private worker"))))))
+(deftest browser-sandbox-has-private-short-scratch
+  (let [embedded (persistent-shard-namespace!)
+        ns (-> (:worker embedded) meta :ns)
+        command (ns-resolve ns 'sandbox-command)
+        opts (command (file "/tmp") ["true"])]
+    (is (every? some? [command opts]))
+    (is (some #{"--tmpfs"} opts))
+    (is (some (fn [[a b]] (and (= a "--tmpfs") (= b "/tmp")))
+              (partition 2 1 opts))
+        "Short /tmp is still a per-job tmpfs, never the shared host /tmp")))
 
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
