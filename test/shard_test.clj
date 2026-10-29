@@ -2988,7 +2988,18 @@ sys.exit(2)")
         (is (< (.indexOf ^String (:out human) "Fatal diagnostic:")
                (.indexOf ^String (:out human) "Failure entries:")))
         (is (not (str/includes? (:out (invoke fx "report" (str (:run fx)) "--edn"))
-                                 "OUTCOMES")))))))
+                                 "OUTCOMES")))
+        (let [vivid (exec! (:project fx)
+                           [(:bb fx) (:shard fx) "report" (str (:run fx))]
+                           {"YGG_COLOR" "always" "YGG_UNICODE" "always"})
+              edn-vivid (exec! (:project fx)
+                               [(:bb fx) (:shard fx) "report" (str (:run fx)) "--edn"]
+                               {"YGG_COLOR" "always" "YGG_UNICODE" "always"})]
+          (is (str/includes? (:out vivid) "\u001b["))
+          (is (str/includes? (:out vivid) "─"))
+          (is (str/includes? (:out vivid) "Socket path too long"))
+          (is (not (str/includes? (:out edn-vivid) "\u001b[")))
+          (is (= :fail (:overall (edn/read-string (:out edn-vivid))))))))))
 
 (deftest readable-ygg-timeline-summary-and-details
   (with-fixture
