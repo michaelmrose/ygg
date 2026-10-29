@@ -1347,6 +1347,20 @@ sys.exit(2)")
         (is (= 23 (get-in t [:totals-ms :wall-ms])))
         (is (= ["a-passed"] (mapv :id (:slowest t))))))))
 
+(deftest worker-logs-claim-loop-lifetime-and-reports-no-false-idle-tail
+  (with-fixture
+    (fn [fx]
+      (enumerate! fx [(job "one" ["bash" "-c" "printf success"])])
+      (let [r (worker fx)]
+        (is (= 0 (:exit r)) (:out r))
+        (is (re-find #"(?m)^SHARD WORKER LOOP START [0-9a-f-]{36} 20\d\d-" (:out r)))
+        (is (re-find #"(?m)^SHARD WORKER LOOP END [0-9a-f-]{36} 20\d\d-" (:out r))))
+      (let [human (invoke fx "report" (str (:run fx)))]
+        (is (= 0 (:exit human)) (:out human))
+        (is (str/includes? (:out human) "SHARD processes"))
+        (is (not (str/includes? (:out human) "tail = to run end")))
+        (is (not (str/includes? (:out human) "idle tail")))))))
+
 (deftest timing-reporting-is-deterministic-and-read-only
   (with-fixture
     (fn [fx]
@@ -3011,10 +3025,10 @@ sys.exit(2)")
           (is (= 0 (:exit alias)) (:out alias))
           (is (not= 0 (:exit rejected)))
           (is (str/includes? (:out rejected) "--summary is supported only"))
-          (is (str/includes? (:out brief) "WORKER  JOBS"))
-          (is (str/includes? (:out brief) "Last completed:"))
-          (is (not (str/includes? (:out brief) "PER-WORKER JOB DETAILS")))
-          (is (str/includes? (:out full) "PER-WORKER JOB DETAILS"))
+          (is (str/includes? (:out brief) "SHARD     SLOT PHASE"))
+          (is (str/includes? (:out brief) "Last completed job:"))
+          (is (not (str/includes? (:out brief) "PER-SHARD JOB DETAILS")))
+          (is (str/includes? (:out full) "PER-SHARD JOB DETAILS"))
           (is (str/includes? (:out full) "alpha")))))))
 
 (defn -main [& _]
