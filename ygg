@@ -5,7 +5,7 @@
 ;;        ygg report [--edn] [--run PATH]
 ;;        ygg explain [--run PATH]
 ;;        ygg jobs [--all] [--sort duration|error] [--run PATH]
-;;        ygg report --timeline [--run PATH] | ygg timeline [--run PATH]
+;;        ygg report --timeline [--summary] [--run PATH] | ygg timeline [--summary] [--run PATH]
 ;; Clone mountpoints: REPO/.ygg/workers/1 ... N; run results: REPO/.ygg/runs/.
 ;; Shard holds an exclusive FileChannel lock on .ygg/.workers.lock while using
 ;; the clones. Ygg clean refuses to proceed while that lock is held.
@@ -619,7 +619,7 @@
                               (> (timeline-elapsed-ms origin job-end) lo))) tasks)
                "#" ".")))))
 
-(defn- timeline! [root {:keys [run]}]
+(defn- timeline! [root {:keys [run summary?]}]
   (let [selected (tail-run! root run)
         report (jobs-report! selected)
         estimates (jobs-estimates! selected report)
@@ -641,45 +641,59 @@
         missing (- (:total report) (count completed))]
     (println "YGG TIMELINE" (name (:overall report))
              "run" (str (.getFileName selected)))
-    (println "Observed completed jobs:" (count completed) "/" (:total report))
-    (if-not (seq completed)
-      (println "No completed worker intervals available (run may still be starting).")
-      (do
-        (println "Measured job window:" (jobs-duration (timeline-elapsed-ms origin end))
-                 "(first job start to last completion; excludes setup/cleanup)")
-        (println "Bars: # executing, . no recorded job; each W# is a display label, not a clone slot")
-        (let [width 48]
-          (println "Time" (format "+%-9s %s" "0s"
-                                  (str "+" (jobs-duration (timeline-elapsed-ms origin end)))))
-          (doseq [[idx {:keys [worker-id jobs]}] (map-indexed vector workers)]
-            (println (format "W%-2d %s  %s" (inc idx)
-                             (timeline-worker-bar origin end jobs width)
-                             (subs worker-id 0 (min 8 (count worker-id)))))))
-        (println "")
+    (println (str (apply str (repeat 78 "="))))
+    (println (format "Jobs: %d/%d  |  Workers observed: %d  |  Window: %s"
+                     (count completed) (:total report) (count workers)
+                     (if (seq completed)
+                       (jobs-duration (timeline-elapsed-ms origin end)) "-")))
+    (when (seq completed)
+      (println "Window measures first job start to last job finish (setup/cleanup excluded).")
+      (println "Bars: # running, . no recorded job; W# is a display label, not a clone slot.")
+      (let [width 48]
+        (println (format "%-7s %s" "Worker" "0s")
+                 "→" (jobs-duration (timeline-elapsed-ms origin end)))
         (doseq [[idx {:keys [worker-id jobs]}] (map-indexed vector workers)]
-          (let [busy (reduce + 0 (map :duration-ms jobs))
-                first-job (first jobs)
-                last-job (last (sort-by :finish jobs))
-                latest-end (:finish last-job)
-                tail (max 0 (timeline-elapsed-ms latest-end end))
-                internal-gaps (reduce + 0
-                                      (map (fn [[a b]]
-                                             (max 0 (timeline-elapsed-ms (:finish a) (:start b))))
-                                           (partition 2 1 jobs)))
-                overlaps (count (filter (fn [[a b]] (.isBefore ^Instant (:start b) (:finish a)))
+          (println (format "W%-6d %s  %s" (inc idx)
+                           (timeline-worker-bar origin end jobs width)
+                           (subs worker-id 0 (min 8 (count worker-id)))))))
+      (println)
+      (println "WORKER  JOBS  FIRST     FINISH    BUSY      GAPS      TAIL")
+      (println (apply str (repeat 78 "-")))
+      (doseq [[idx {:keys [jobs]}] (map-indexed vector workers)]
+        (let [first-job (first jobs)
+              last-end (reduce (fn [latest {:keys [finish]}]
+                                 (if (.isAfter ^Instant finish latest) finish latest))
+                               (:finish first-job) (rest jobs))
+              busy (reduce + 0 (map :duration-ms jobs))
+              internal-gaps (reduce + 0
+                                    (map (fn [[a b]]
+                                           (max 0 (timeline-elapsed-ms (:finish a) (:start b))))
+                                         (partition 2 1 jobs)))
+              tail (max 0 (timeline-elapsed-ms last-end end))]
+          (println (format "W%-6d %5d  %-9s %-9s %-9s %-9s %s"
+                           (inc idx) (count jobs)
+                           (jobs-duration (timeline-elapsed-ms origin (:start first-job)))
+                           (jobs-duration (timeline-elapsed-ms origin last-end))
+                           (jobs-duration busy) (jobs-duration internal-gaps)
+                           (jobs-duration tail)))))
+      (let [critical (last (sort-by (juxt :finish :id) completed))]
+        (println)
+        (println "Last completed:" (:id critical)
+                 "[" (jobs-duration (:duration-ms critical)) "]"))
+      (when-not summary?
+        (println)
+        (println "PER-WORKER JOB DETAILS  (use --summary to hide this section)")
+        (println (apply str (repeat 78 "=")))
+        (doseq [[idx {:keys [worker-id jobs]}] (map-indexed vector workers)]
+          (let [overlaps (count (filter (fn [[a b]] (.isBefore ^Instant (:start b) (:finish a)))
                                         (partition 2 1 jobs)))]
-            (println (format "Worker W%d %s | jobs %d | busy %s | between-job gaps %s | idle tail %s"
-                             (inc idx) worker-id (count jobs)
-                             (jobs-duration busy) (jobs-duration internal-gaps)
-                             (jobs-duration tail)))
+            (println (format "W%d  %s  |  %d job(s)" (inc idx) worker-id (count jobs)))
             (when (pos? overlaps)
               (println "  WARNING: overlapping receipts on this worker:" overlaps))
             (println "  START     GAP       ACTUAL    ESTIMATE   STATUS       JOB")
             (loop [prior nil [task & more] (seq jobs)]
               (when task
-                (let [gap (if prior
-                            (timeline-elapsed-ms (:finish prior) (:start task))
-                            nil)
+                (let [gap (when prior (timeline-elapsed-ms (:finish prior) (:start task)))
                       gap-label (cond
                                   (nil? gap) "-"
                                   (neg? gap) (str "OVERLAP " (jobs-duration (- gap)))
@@ -691,11 +705,9 @@
                                    (jobs-duration (get estimates (:id task)))
                                    (name (:status task)) (:id task)))
                   (recur task more))))
-            (println)))
-        (let [critical (last (sort-by (juxt :finish :id) completed))]
-          (println "Last completed job:" (:id critical)
-                   "worker" (:worker-id critical)
-                   "duration" (jobs-duration (:duration-ms critical))))))
+            (println)))))
+    (when-not (seq completed)
+      (println "No completed worker intervals available (run may still be starting)."))
     (when (pos? missing)
       (println "INCOMPLETE OBSERVATION:" missing
                "jobs have no completed worker interval; no times inferred"))
@@ -715,10 +727,10 @@
            "  ygg status [--edn] [ROOT]"
            "  ygg clean [ROOT]"
            "  ygg tail [--workers|--stderr|--all] [--once] [--run RUN] [ROOT]"
-           "  ygg report [--edn|--timeline] [--run RUN] [ROOT]"
+           "  ygg report [--edn|--timeline] [--summary] [--run RUN] [ROOT]"
            "  ygg explain [--run RUN] [ROOT]"
            "  ygg jobs [--all] [--sort duration|error] [--run RUN] [ROOT]"
-           "  ygg timeline [--run RUN] [ROOT]"
+           "  ygg timeline [--summary] [--run RUN] [ROOT]"
            ""
            "Workspace commands:"
            "  create     Snapshot the root ZFS dataset and mount N verified clones"
@@ -737,6 +749,7 @@
            "  jobs       List 20 slowest completed jobs by default; --all lists all;"
            "             --sort duration (default) or error (absolute estimate delta)."
            "  timeline   Show worker job ordering, busy time, gaps and idle tails."
+           "             --summary shows only the overview and worker-load table."
            ""
            "Options and paths:"
            "  ROOT       Repository/ZFS dataset root (default: current directory)."
@@ -744,6 +757,7 @@
            "             ROOT/.ygg/runs/; defaults to the safe latest symlink."
            "  -n N       Clone count for create; other commands do not use -n."
            "  --edn      Available only for status and report."
+           "  --summary  Compact timeline, without per-job listings."
            "  --help,-h  Print this complete help; valid with any command."
            ""
            "Configuration and prerequisites:"
@@ -787,6 +801,9 @@
               (let [sort-key ({"duration" :duration "error" :error} (second xs))]
                 (when-not sort-key (fail! "--sort must be duration or error"))
                 (recur (nnext xs) (assoc parsed :sort sort-key))))
+          (= "--summary" x)
+          (do (when (:summary? parsed) (fail! "Duplicate --summary"))
+              (recur (next xs) (assoc parsed :summary? true)))
           (= "--timeline" x)
           (do (when (:timeline? parsed) (fail! "Duplicate --timeline"))
               (recur (next xs) (assoc parsed :timeline? true)))
@@ -852,6 +869,10 @@
       (fail! "Clone count must be 1..256"))
     (when (and (:edn? cli) (:timeline? cli))
       (fail! "--edn and --timeline cannot be combined"))
+    (when (and (:summary? cli)
+               (not (or (= action :timeline)
+                        (and (= action :report) (:timeline? cli)))))
+      (fail! "--summary is supported only for timeline or report --timeline"))
     (when (and (:timeline? cli) (not= action :report))
       (fail! "--timeline is supported only for report"))
     (when (and (:edn? cli) (not (#{:status :report} action)))
