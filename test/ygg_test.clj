@@ -505,6 +505,38 @@
           (is (str/includes? (:out unknown) "UNMAPPED: 1"))
           (is (re-find #"22222222\s+\?\s+\?" (:out unknown))))))))
 
+;; v1203: Ygg is the stable public entrypoint for recursive path execution.
+;; Use a fake sibling Shard to verify argv preservation and exit propagation
+;; without provisioning host ZFS or claiming to execute tests.
+(deftest test-path-delegates-to-version-matched-shard
+  (let [dir (.toFile (Files/createTempDirectory "ygg-path-cli-" (make-array FileAttribute 0)))
+        ygg (path dir "ygg")
+        shard (path dir "shard")]
+    (try
+      (write-executable! ygg (slurp (locate-ygg!)))
+      (write-executable! shard
+                         (str "#!/bin/sh\n"
+                              "printf '%s\\n' \"$@\"\n"
+                              "exit 0\n"))
+      (let [run (sh/sh (bb-command) (.getAbsolutePath ygg) "test"
+                       "test/demo/nested" "-n" "6" :dir (.getAbsolutePath dir))]
+        (is (= 0 (:exit run)) (pr-str run))
+        (is (= ["run" "--workers" "6" "--path" "test/demo/nested"]
+               (str/split-lines (str/trim (:out run))))))
+      (let [run (sh/sh (bb-command) (.getAbsolutePath ygg) "test"
+                       "test/demo" :dir (.getAbsolutePath dir))]
+        (is (= 0 (:exit run)) (pr-str run))
+        (is (= ["run" "--workers" "1" "--path" "test/demo"]
+               (str/split-lines (str/trim (:out run))))))
+      (is (not (zero? (:exit (sh/sh (bb-command) (.getAbsolutePath ygg)
+                                     "test" :dir (.getAbsolutePath dir))))))
+      (Files/delete (.toPath shard))
+      (let [missing (sh/sh (bb-command) (.getAbsolutePath ygg) "test" "test/demo"
+                           :dir (.getAbsolutePath dir))]
+        (is (not (zero? (:exit missing))))
+        (is (str/includes? (:err missing) "sibling Shard executable")))
+      (finally (remove-tree! dir)))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'ygg-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
