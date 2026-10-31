@@ -3046,6 +3046,66 @@ sys.exit(2)")
           (is (str/includes? (:out full) "PER-SHARD JOB DETAILS"))
           (is (str/includes? (:out full) "alpha")))))))
 
+;; v1204: Path-driven selection discovers a real JVM namespace corpus on
+;; demand, rather than accepting a hand-maintained or prewritten inventory.
+(deftest path-selector-recursively-restricts-discovered-jvm-jobs
+  (with-fixture
+    (fn [fx]
+      (let [project (:project fx)
+            paths ["test/demo/core_test.clj"
+                   "test/demo/nested/feature_test.cljc"
+                   "test/elsewhere/other_test.clj"
+                   "src/demo/core.clj"]
+            names ["demo.core-test" "demo.nested.feature-test"
+                   "elsewhere.other-test"]
+            jobs (mapv (fn [n] {:id (str "gesso-jvm-" n)
+                                :gate :jvm :runtime :gesso-jvm
+                                :unit {:type :gesso-jvm-namespace :name n}
+                                :command ["bb" "script/gesso_test.clj"
+                                          "jvm:namespace:prepared" n]
+                                :depends-on [] :timeout-ms 30000 :requires #{}})
+                       names)
+            runtimes {:gesso-jvm {:identity "test"
+                                  :capabilities #{}
+                                  :execution :persistent-jvm
+                                  :session-command ["clojure" "-M:test:formal"
+                                                    "-m" "shard.worker.jvm"]}}
+            _ (doseq [path paths]
+                (let [f (file project path)]
+                  (.mkdirs (.getParentFile f))
+                  (spit f "(ns fixture)\n")))
+            embedded (persistent-shard-namespace!)
+            n (:ns (meta (:worker embedded)))
+            select (var-get (ns-resolve n 'path-inventory!))
+            parse (var-get (ns-resolve n 'parse-run-options!))
+            inventory {:jobs jobs :runtimes runtimes}
+            ids (fn [selection] (set (map :id (:jobs selection))))]
+        (is (= #{"gesso-jvm-demo.core-test" "gesso-jvm-demo.nested.feature-test"}
+               (ids (select project "test/demo" inventory))))
+        (is (= #{"gesso-jvm-demo.nested.feature-test"}
+               (ids (select project "test/demo/nested" inventory))))
+        (is (= #{"gesso-jvm-demo.core-test"}
+               (ids (select project "test/demo/core_test.clj" inventory))))
+        (is (= #{"gesso-jvm-demo.core-test" "gesso-jvm-demo.nested.feature-test"}
+               (ids (select project "src/demo" inventory))))
+        (is (= #{"gesso-jvm-demo.core-test"}
+               (ids (select project "src/demo/core.clj" inventory))))
+        (is (= {:workers 6 :scope nil :path "test/demo"}
+               (parse ["--path" "test/demo" "--workers" "6"])))
+        (is (thrown? Exception
+              (parse ["--workers" "2" "--scope" "jvm" "--path" "test/demo"])))
+        (is (thrown? Exception
+              (parse ["--workers" "2" "--path" "test/demo" "--inventory" "bb" "x"])))
+        (doseq [invalid ["../outside" ".git" "test/empty" "test/elsewhere/other.clj"]]
+          (is (thrown? Exception (select project invalid inventory)) invalid))
+        ;; The selected test file may NOT be a symlink out of the tree.
+        (let [external (file (:base fx) "outside_test.clj")
+              link (file project "test/demo/unsafe_test.clj")]
+          (spit external "(ns demo.unsafe-test)\n")
+          (Files/createSymbolicLink (.toPath link) (.toPath external) attrs)
+          (is (thrown? Exception (select project "test/demo/unsafe_test.clj"
+                                         inventory))))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
