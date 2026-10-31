@@ -3106,6 +3106,65 @@ sys.exit(2)")
           (is (thrown? Exception (select project "test/demo/unsafe_test.clj"
                                          inventory))))))))
 
+;; v1208: namespace shorthand is resolved from actual discovered JVM jobs,
+;; never a saved inventory file or a substring/guess-based path mapping.
+(deftest namespace-selection-is-recursive-deterministic-and-ambiguity-safe
+  (let [embedded (persistent-shard-namespace!)
+        n (:ns (meta (:worker embedded)))
+        select (var-get (ns-resolve n 'namespace-inventory!))
+        parse (var-get (ns-resolve n 'parse-run-options!))
+        names ["gesso.model.command-test"
+               "gesso.model.tx-model-test"
+               "gesso.model.deep.other-test"
+               "gesso.live.model-test"
+               "gesso.live.application-preflight.semantic-audit-test"
+               "gesso.live.application-preflight.relational-definition.sequence-test"
+               "gesso.choreo.semantics-test"]
+        jvm-job (fn [name]
+                  {:id (str "gesso-jvm-" name)
+                   :gate :jvm :runtime :gesso-jvm
+                   :unit {:type :gesso-jvm-namespace :name name}
+                   :command ["bb" "script/gesso_test.clj"
+                             "jvm:namespace:prepared" name]
+                   :depends-on [] :timeout-ms 30000 :requires #{}})
+        inventory {:runtimes {:gesso-jvm {:execution :persistent-jvm}}
+                   :jobs (mapv jvm-job names)}
+        chosen (fn [selector]
+                 (set (map #(get-in % [:unit :name])
+                           (:jobs (select selector inventory)))))]
+    (is (= (chosen "model") (chosen "gesso.model")))
+    (is (= #{"gesso.model.command-test"
+             "gesso.model.tx-model-test"
+             "gesso.model.deep.other-test"}
+           (chosen "model"))
+        "The model subtree wins over a terminal model-test in gesso.live")
+    (is (= #{"gesso.model.command-test"} (chosen "model.command")))
+    (is (= #{"gesso.model.command-test"} (chosen "gesso.model.command-test")))
+    (is (= #{"gesso.live.application-preflight.semantic-audit-test"
+             "gesso.live.application-preflight.relational-definition.sequence-test"}
+           (chosen "application-preflight")))
+    (is (= #{"gesso.live.application-preflight.relational-definition.sequence-test"}
+           (chosen "relational_definition.sequence")))
+    (is (= #{} (set (filter #(clojure.string/starts-with? % "gesso.live")
+                            (chosen "model")))))
+    (is (= {:workers 6 :scope nil :namespace "model"}
+           (parse ["--workers" "6" "--namespace" "model"])))
+    (doseq [bad [["--workers" "2" "--scope" "jvm" "--namespace" "model"]
+                 ["--workers" "2" "--path" "test/gesso" "--namespace" "model"]
+                 ["--workers" "2" "--namespace" "model" "--inventory" "bb" "x"]
+                 ["--workers" "2" "--namespace" "../model"]]]
+      (is (thrown? Exception (parse bad)) (pr-str bad)))
+    (doseq [bad ["../model" "model/tx" "unknown" "model..command"]]
+      (is (thrown? Exception (select bad inventory)) bad))
+    (let [ambiguous (assoc inventory :jobs
+                           (conj (:jobs inventory)
+                                 (jvm-job "demo.other.model.extra-test")))]
+      (is (thrown-with-msg? Exception #"Ambiguous test namespace"
+            (select "model" ambiguous)))
+      (is (= (chosen "gesso.model")
+             (set (map #(get-in % [:unit :name])
+                       (:jobs (select "gesso.model" ambiguous)))))))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'shard-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
