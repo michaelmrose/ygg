@@ -1,6 +1,6 @@
 #!/usr/bin/env bb
 ;; Ygg: conservative ZFS workspace clones for a repository at a dataset root.
-;; Usage: ygg test TEST-PATH [-n N] | ygg [-n N] create | status [--edn] | clean
+;; Usage: ygg NAMESPACE [-n N] | ygg [-n N] create | status [--edn] | clean
 ;;        ygg tail [--workers|--stderr|--all] [--run PATH] [--once]
 ;;        ygg report [--edn] [--run PATH]
 ;;        ygg explain [--run PATH]
@@ -864,7 +864,9 @@
            ""
            "Usage:"
            "  ygg help | ygg --help | ygg -h"
-           "  ygg test TEST-PATH [-n N]   Recursively run discovered JVM tests in PATH"
+           "  ygg model [-n N]           Recursively run gesso.model JVM tests"
+           "  ygg gesso.model [-n N]     Same test selection, explicit namespace"
+           "  ygg gesso.live.application-preflight [-n N]"
            "  ygg create [-n N] [ROOT]"
            "  ygg status [--edn] [ROOT]"
            "  ygg clean [ROOT]"
@@ -875,14 +877,14 @@
            "  ygg timeline [--summary] [--run RUN] [ROOT]"
            "  All human-readable views accept --color=auto|always|never and --unicode|--ascii."
            ""
-           "Path-driven test execution (from the Gesso repository root):"
-           "  test       Run all discovered JVM test namespaces below test/ or src/."
-           "             TEST-PATH may be a directory or an individual .clj/.cljc file."
-           "             The src/ path selects corresponding test/ paths; no saved"
-           "             inventory or curated namespace list is needed."
-           "             Runs the normal integrity check once, then uses Shard's"
-           "             isolated workers, claims, persistent JVM and receipts."
-           "             Default -n 1; -n N selects parallel worker capacity."
+           "Namespace-driven test selection (run from the Gesso repository root):"
+           "  NAMESPACE  Exact test namespace, package prefix, or unique short name."
+           "             model resolves to gesso.model if uniquely identifiable."
+           "             A package includes all descendant test namespaces."
+           "             Ambiguous names fail with fully qualified alternatives."
+           "             Names are discovered from Gesso's test runner at invocation;"
+           "             no prewritten inventory or file paths are required."
+           "             Defaults to -n 1; -n N uses parallel Shard workers."
            ""
            "Workspace commands:"
            "  create     Snapshot the root ZFS dataset and mount N verified clones"
@@ -908,7 +910,7 @@
            "  ROOT       Repository/ZFS dataset root (default: current directory)."
            "  --run RUN  Published run name (run-...) or absolute path inside"
            "             ROOT/.ygg/runs/; defaults to the safe latest symlink."
-           "  -n N       Clone count for create or worker count for test."
+           "  -n N       Clone count for create or worker count for namespace selection."
            "  --edn      Available only for status and report."
            "  --summary  Compact timeline, without per-job listings."
            "  --color=... auto (TTY default), always, never; NO_COLOR disables auto color."
@@ -1017,7 +1019,7 @@
     (fn []
       (legacy-lock-absent! root)
       (work))))
-(defn- run-path-tests! [root test-path n]
+(defn- run-path-tests! [root selection n namespace?]
   ;; Ygg is the user-facing interface; Shard remains the single coordinator.
   ;; The sibling executable is mandatory: never execute an unrelated `shard`
   ;; binary from PATH and silently lose the versioned admission policy.
@@ -1026,11 +1028,12 @@
             (fail! "Cannot locate the installed Ygg executable"))
         sibling (io/file (.getParentFile (.getCanonicalFile (io/file source))) "shard")
         _ (when-not (.isFile sibling)
-            (fail! (str "Ygg path tests require the sibling Shard executable: " sibling)))
+            (fail! (str "Ygg namespace tests require the sibling Shard executable: " sibling)))
         cmd (vec (concat (if (.canExecute sibling)
                            [(.getCanonicalPath sibling)]
                            ["bb" (.getCanonicalPath sibling)])
-                         ["run" "--workers" (str n) "--path" test-path]))
+                         ["run" "--workers" (str n)
+                          (if namespace? "--namespace" "--path") selection]))
         builder (ProcessBuilder. ^java.util.List cmd)]
     (.directory builder (io/file root))
     (.inheritIO builder)
@@ -1040,7 +1043,13 @@
 
 (defn -main [& argv]
   (let [cli (parse-args argv)
-        root (canonical (if (= :test (:action cli))
+        ;; Bare names denote Clojure namespaces. Do not interpret them as
+        ;; relative filesystem paths or as a stored scheduling queue.
+        namespace? (and (nil? (:action cli))
+                        (string? (:root cli))
+                        (boolean (re-matches #"[A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z][A-Za-z0-9_-]*)*"
+                                             (:root cli))))
+        root (canonical (if (or (= :test (:action cli)) namespace?)
                           (System/getProperty "user.dir")
                           (or (:root cli) (System/getProperty "user.dir"))))
         config (let [p (f root "ygg.edn")]
@@ -1048,12 +1057,12 @@
         _ (when-not (map? config) (fail! "ygg.edn must contain a map"))
         _ (when (contains? config :zfs-command)
             (fail! ":zfs-command is no longer configurable for privileged safety"))
-        action (or (:action cli) (:action config))
+        action (if namespace? :select (or (:action cli) (:action config)))
         n (or (:n cli) (:n config) 1)]
     (reset! display-mode (select-keys cli [:color :unicode]))
     (when-not (.isDirectory (io/file root)) (fail! "Not a directory"))
-    (when-not (#{:create :clean :status :tail :report :explain :jobs :timeline :test} action)
-      (fail! "Specify test, create, clean, status, tail, report, explain, jobs, timeline or :action in ygg.edn"))
+    (when-not (#{:create :clean :status :tail :report :explain :jobs :timeline :test :select} action)
+      (fail! "Specify a test namespace (e.g. model) or create, clean, status, tail, report, explain, jobs, timeline"))
     (when-not (and (integer? n) (<= 1 n 256))
       (fail! "Clone count must be 1..256"))
     (when (and (:edn? cli) (:timeline? cli))
@@ -1086,7 +1095,8 @@
                      (not (str/blank? (:root cli))))
         (fail! "Usage: ygg test TEST-PATH [-n N]")))
     (case action
-      :test (run-path-tests! root (:root cli) n)
+      :test (run-path-tests! root (:root cli) n false)
+      :select (run-path-tests! root (:root cli) n true)
       :tail (tail! root (cond-> cli (:all? cli) (assoc :mode :all)))
       :report (if (:timeline? cli) (timeline! root cli) (report! root cli))
       :timeline (timeline! root cli)
