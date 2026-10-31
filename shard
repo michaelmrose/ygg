@@ -2222,6 +2222,69 @@
               "Path selector admitted a non-JVM job")
     {:runtimes (:runtimes inventory) :jobs selected}))
 
+;; Namespace selectors are resolved against freshly discovered JVM jobs.
+;; A short name is admitted only when it denotes one unambiguous namespace
+;; package; never guess based on filesystem traversal order or substring hits.
+(defn- namespace-inventory! [requested inventory]
+  (require! (and (string? requested)
+                 (re-matches #"[A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z][A-Za-z0-9_-]*)*"
+                             requested))
+            "Namespace selector must be a dotted Clojure name, not a path")
+  (let [requested (str/replace requested "_" "-")
+        jobs (filterv #(= :gesso-jvm-namespace (get-in % [:unit :type]))
+                      (:jobs inventory))
+        names (mapv #(get-in % [:unit :name]) jobs)
+        _ (require! (every? #(and (string? %)
+                                   (re-matches #"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*" %))
+                             names)
+                    "Discovered JVM job contains an invalid namespace")
+        directories (into #{}
+                          (mapcat (fn [name]
+                                    (let [segments (str/split name #"\.")]
+                                      (for [depth (range 1 (count segments))]
+                                        (str/join "." (take depth segments))))))
+                          names)
+        ;; The explicit name can contain -test or omit it. Both denote exactly
+        ;; one test job, unlike a directory which selects its whole subtree.
+        file-names (into {}
+                         (mapcat (fn [name]
+                                   (let [stem (str/replace name #"-test$" "")]
+                                     [[name name] [stem name]])))
+                         names)
+        ends-with-selector? (fn [candidate]
+                              (or (= candidate requested)
+                                  (str/ends-with? candidate (str "." requested))))
+        matching-directories (if (contains? directories requested)
+                               [requested]
+                               (sort (filter ends-with-selector? directories)))
+        ;; Directory candidates take priority over file names. Thus `model`
+        ;; selects gesso.model/, not gesso.live.model-test.clj.
+        matching-files (sort (distinct
+                              (for [[alias name] file-names
+                                    :when (ends-with-selector? alias)] name)))
+        candidates (if (seq matching-directories)
+                     matching-directories matching-files)
+        _ (require! (seq candidates)
+                    (str "No discovered JVM test namespace matches '" requested "'"))
+        ;; Ancestor and descendant package names can share a suffix only if
+        ;; they denote genuinely different packages, and must be disambiguated.
+        _ (require! (= 1 (count candidates))
+                    (str "Ambiguous test namespace '" requested "': "
+                         (str/join ", " candidates)
+                         ". Use a fully qualified namespace."))
+        selected-name (first candidates)
+        selected (if (seq matching-directories)
+                   (filterv (fn [job]
+                              (str/starts-with?
+                                (get-in job [:unit :name]) (str selected-name ".")))
+                            jobs)
+                   (filterv #(= selected-name (get-in % [:unit :name])) jobs))]
+    (require! (seq selected)
+              "Namespace selector resolved to no executable JVM tests")
+    {:runtimes (:runtimes inventory) :jobs selected
+     :selection {:requested requested :resolved selected-name
+                 :count (count selected)}}))
+
 (defn- inventory-manifest! [root head status inventory]
   (let [jobs (:jobs inventory)
         runtimes (or (:runtimes inventory)
@@ -2437,14 +2500,16 @@
                  (println "SHARD UNSAFE TO CLEAN:" (.getMessage ex)))))))))
 
 (defn- parse-run-options! [argv]
-  (loop [args (vec argv) n nil scope nil path nil]
+  (loop [args (vec argv) n nil scope nil path nil namespace nil]
     (cond
       (empty? args)
       (do (require! (some? n)
-                    "Usage: shard run --workers N [--scope SCOPE | --path TEST-PATH | --inventory COMMAND ARG ...]")
-          (do (require! (not (and scope path))
-                        "--path and --scope are mutually exclusive")
-              (cond-> {:workers n :scope scope} path (assoc :path path))))
+                    "Usage: shard run --workers N [--scope SCOPE | --namespace NS | --path TEST-PATH | --inventory COMMAND ARG ...]")
+          (require! (<= (count (filter some? [scope path namespace])) 1)
+                    "--scope, --path, and --namespace are mutually exclusive")
+          (cond-> {:workers n :scope scope}
+            path (assoc :path path)
+            namespace (assoc :namespace namespace)))
 
       (= "--workers" (first args))
       (do (require! (and (nil? n) (second args))
@@ -2453,28 +2518,37 @@
                             (catch Exception _ nil))]
             (require! (and parsed (<= 1 parsed 256))
                       "--workers must be 1..256")
-            (recur (subvec args 2) parsed scope path)))
+            (recur (subvec args 2) parsed scope path namespace)))
 
       (= "--scope" (first args))
-      (do (require! (and (nil? scope) (second args)
+      (do (require! (and (nil? scope) (nil? path) (nil? namespace)
+                         (second args)
                          (re-matches #"[a-z][a-z:]*" (second args)))
-                    "Missing or duplicate --scope")
-          (recur (subvec args 2) n (second args) path))
+                    "Missing or duplicate --scope, or conflict with selection")
+          (recur (subvec args 2) n (second args) path namespace))
 
       (= "--path" (first args))
-      (do (require! (and (nil? path) (nil? scope) (second args)
-                         (not (str/blank? (second args))))
-                    "Missing/duplicate --path, or conflict with --scope")
-          (recur (subvec args 2) n scope (second args)))
+      (do (require! (and (nil? path) (nil? scope) (nil? namespace)
+                         (second args) (not (str/blank? (second args))))
+                    "Missing/duplicate --path, or conflict with selection")
+          (recur (subvec args 2) n scope (second args) namespace))
+
+      (= "--namespace" (first args))
+      (do (require! (and (nil? namespace) (nil? scope) (nil? path)
+                         (second args)
+                         (re-matches #"[A-Za-z][A-Za-z0-9_-]*(?:\.[A-Za-z][A-Za-z0-9_-]*)*"
+                                     (second args)))
+                    "Missing/invalid/duplicate --namespace, or conflict with selection")
+          (recur (subvec args 2) n scope path (second args)))
 
       (= "--inventory" (first args))
-      (do (require! (and (some? n) (nil? scope) (nil? path))
-                    "Cannot combine --inventory with --scope or --path; supply --workers N first")
+      (do (require! (and (some? n) (nil? scope) (nil? path) (nil? namespace))
+                    "Cannot combine --inventory with --scope, --path, or --namespace")
           (let [cmd (vec (rest args))]
             (require! (string-vector? cmd) "Missing inventory command")
             {:workers n :inventory-command cmd}))
 
-      :else (fail! "Usage: shard run --workers N [--scope SCOPE | --path TEST-PATH | --inventory COMMAND ARG ...]"))))
+      :else (fail! "Usage: shard run --workers N [--scope SCOPE | --namespace NS | --path TEST-PATH | --inventory COMMAND ARG ...]"))))
 
 (def ^:private supported-gesso-scopes
   #{"all" "quick" "jvm" "formal" "cljs" "node" "node:choreo" "node:browser"
@@ -2507,12 +2581,13 @@
   (let [discovered (run-inventory! root
                      (if prepared?
                        ["bb" "script/gesso_test.clj" "inventory:prepared"
-                        (if (:path opts) "jvm" (or (:scope opts) "all"))]
+                        (if (or (:path opts) (:namespace opts)) "jvm" (or (:scope opts) "all"))]
                        (or (:inventory-command opts)
                            (default-inventory-command root))))
-        inventory (if (:path opts)
-                    (path-inventory! root (:path opts) discovered)
-                    discovered)
+        inventory (cond
+                    (:namespace opts) (namespace-inventory! (:namespace opts) discovered)
+                    (:path opts) (path-inventory! root (:path opts) discovered)
+                    :else discovered)
         _ (when prepared? (verify-prepared-jobs! (:jobs inventory)))
         provisional-status {:snapshot-guid "pending-source-snapshot"}
         manifest (inventory-manifest! root head provisional-status inventory)
@@ -2522,7 +2597,8 @@
         data (scheduling-data root (:jobs manifest))
         specs (worker-specs virtual-clones (:jobs manifest) (:estimated data))
         schedule (prepare-schedule root manifest specs data)]
-    {:inventory inventory :schedule schedule :job-count (count (:jobs manifest))}))
+    {:inventory inventory :schedule schedule :job-count (count (:jobs manifest))
+     :selection (:selection inventory)}))
 
 (defn- preflight-once! [root head]
   (let [started (System/nanoTime)]
@@ -2561,8 +2637,9 @@
       (fn []
         (let [head (source-revision! root)
               gesso? (gesso-project? root)
-              _ (require! (or gesso? (and (nil? (:scope opts)) (nil? (:path opts))))
-                          "--scope/--path requires a Gesso project with prepared inventory")
+              _ (require! (or gesso? (and (nil? (:scope opts)) (nil? (:path opts))
+                                   (nil? (:namespace opts))))
+                          "--scope/--namespace/--path requires a Gesso project with prepared inventory")
               _ (when (:scope opts)
                   (require! (contains? supported-gesso-scopes (:scope opts))
                             "Unsupported Gesso test scope" {:scope (:scope opts)}))
@@ -2585,6 +2662,8 @@
           (when preflight
             (println "SHARD PREFLIGHT" (name (:status preflight))
                      "ONCE" (:duration-ms preflight) "ms"))
+          (when-let [{:keys [requested resolved count]} (:selection preparation)]
+            (println "SHARD NAMESPACE" requested "=>" resolved (str "(" count " jobs)")))
           (println "SHARD PREPARED" (:job-count preparation) "jobs")
           (flush)
           (sandbox-preflight! root)
@@ -2615,8 +2694,10 @@
                             (canonical-edn {:format :shard/source :version 1
                                             :git-head head
                                             :preflight preflight
-                                            :scope (when (and gesso? (not (:path opts))) (or (:scope opts) "all"))
+                                            :scope (when (and gesso? (not (:path opts)) (not (:namespace opts)))
+                                                     (or (:scope opts) "all"))
                                             :path (:path opts)
+                                            :namespace (:namespace opts)
                                             :ygg-run-id (:run-id status)
                                             :ygg-snapshot (:snapshot status)
                                             :inventory-sha256 (:inventory-sha256 manifest)
