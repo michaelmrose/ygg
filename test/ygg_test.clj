@@ -537,6 +537,40 @@
         (is (str/includes? (:err missing) "sibling Shard executable")))
       (finally (remove-tree! dir)))))
 
+;; v1207: the primary test interface takes a namespace without a redundant
+;; `test` verb or filesystem path; legacy path execution remains compatible.
+(deftest namespace-selector-delegates-without-a-test-verb
+  (let [dir (.toFile (Files/createTempDirectory "ygg-namespace-cli-" (make-array FileAttribute 0)))
+        ygg (path dir "ygg")
+        shard (path dir "shard")]
+    (try
+      (write-executable! ygg (slurp (locate-ygg!)))
+      (write-executable! shard
+                         (str "#!/bin/sh\n"
+                              "printf '%s\\n' \"$@\"\n"
+                              "exit 0\n"))
+      (doseq [[selector workers] [["model" "1"]
+                                  ["gesso.model" "6"]
+                                  ["application-preflight" "4"]
+                                  ["model.command-test" "2"]]]
+        (let [args (if (= workers "1") [selector]
+                       [selector "-n" workers])
+              run (apply sh/sh (concat [(bb-command) (.getAbsolutePath ygg)]
+                                       args [:dir (.getAbsolutePath dir)]))]
+          (is (= 0 (:exit run)) (pr-str run))
+          (is (= ["run" "--workers" workers "--namespace" selector]
+                 (str/split-lines (str/trim (:out run)))))))
+      (doseq [invalid ["../other" "gesso/model" "model..foo"]]
+        (let [result (sh/sh (bb-command) (.getAbsolutePath ygg)
+                            invalid :dir (.getAbsolutePath dir))]
+          (is (not= 0 (:exit result)) invalid)))
+      (Files/delete (.toPath shard))
+      (let [missing (sh/sh (bb-command) (.getAbsolutePath ygg)
+                           "model" :dir (.getAbsolutePath dir))]
+        (is (not= 0 (:exit missing)))
+        (is (str/includes? (:err missing) "sibling Shard executable")))
+      (finally (remove-tree! dir)))))
+
 (defn -main [& _]
   (let [{:keys [fail error]} (run-tests 'ygg-test)]
     (when (pos? (+ fail error)) (System/exit 1))))
