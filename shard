@@ -7,7 +7,7 @@
 ;;        ./shard report RUN-DIR [--edn]
 ;;        ./shard explain RUN-DIR
 ;;        ./shard gesso-inventory [GESSO-ROOT]  ; EDN on stdout
-;;        ./shard run --workers N [--scope SCOPE]
+;;        ./shard run --workers N [--scope SCOPE | --path TEST-PATH]
 ;;        ./shard run --workers N --inventory COMMAND ARG ...  ; generic projects
 ;; The executable runs from a project's clone, not necessarily from the Ygg
 ;; repository. Resolve Shard's OWN namespaces from the executable location;
@@ -2150,6 +2150,78 @@
               "No Gesso test runner at this project root")
     (run-inventory! root ["bb" "script/gesso_test.clj" "inventory"])))
 
+;; On-demand recursive selection. Gesso's already-strict JVM namespace scanner
+;; builds the inventory at invocation time; no prewritten jobs.edn or curated
+;; namespace list is required. No host-provided command or EDN is executed as
+;; part of path selection. Directory selection includes all descendant tests.
+(defn- path-test-selector! [root requested]
+  (require! (and (string? requested) (not (str/blank? requested)))
+            "--path requires a nonempty test or source path")
+  (let [project (.getCanonicalFile (io/file root))
+        source-root (.getCanonicalFile (io/file project "src"))
+        tests-root (.getCanonicalFile (io/file project "test"))
+        selected (.getCanonicalFile (io/file project requested))
+        selected-path (.toPath selected)
+        tests-path (.toPath tests-root)
+        source-path (.toPath source-root)
+        source? (.startsWith selected-path source-path)
+        test? (.startsWith selected-path tests-path)
+        _ (require! (or source? test?)
+                    "--path must resolve inside this project's src/ or test/ tree"
+                    {:path requested})
+        _ (require! (or (.isDirectory selected) (.isFile selected))
+                    "--path does not exist" {:path requested})
+        test-target (if source?
+                      (let [relative (.relativize source-path selected-path)
+                            candidate (.toFile (.resolve tests-path relative))]
+                        (if (.isFile selected)
+                          (let [stem (str/replace (.getName candidate) #"\.clj[c]?$" "")]
+                            (require! (not= stem (.getName candidate))
+                                      "A source file path must end in .clj or .cljc")
+                            ;; A source file corresponds to a *_test namespace.
+                            (io/file (.getParentFile candidate) (str stem "_test")))
+                          candidate))
+                      selected)
+        target-path (.toPath test-target)
+        _ (require! (.startsWith target-path tests-path)
+                    "Resolved test path escapes test/" {:path requested})
+        directory? (.isDirectory selected)]
+    (when (and test? (not directory?))
+      (require! (boolean (re-matches #".*_test\.clj(?:c)?$" (.getName selected)))
+                "Test file path must name a *_test.clj or *_test.cljc file"
+                {:path requested}))
+    {:test-root tests-root :target target-path :directory? directory?
+     :path (str (.relativize (.toPath project) selected-path))}))
+
+(defn- path-test-job? [{:keys [test-root target directory?]} job]
+  (let [namespace (get-in job [:unit :name])
+        relative (str (str/replace (str namespace) "." "/") )
+        ;; Hyphens in Clojure namespace segments map to underscores in paths.
+        stem (str/replace relative "-" "_")
+        base (.toPath (io/file test-root stem))]
+    (some (fn [extension]
+            (let [candidate (.toFile (.getParent base))
+                  file-path (.toPath (io/file candidate (str (.getName (.toFile base)) extension)))]
+              (and (.isFile (.toFile file-path))
+                   (.startsWith (.toPath (.getCanonicalFile (.toFile file-path)))
+                                (.toPath test-root))
+                   (if directory? (.startsWith file-path target)
+                       ;; Source file selection uses the stem, test file the whole name.
+                       (or (= file-path target)
+                           (= (.toString file-path) (str target ".clj"))
+                           (= (.toString file-path) (str target ".cljc")))))))
+          [".clj" ".cljc"])))
+
+(defn- path-inventory! [root requested inventory]
+  (let [selector (path-test-selector! root requested)
+        selected (filterv #(path-test-job? selector %) (:jobs inventory))]
+    (require! (seq selected)
+              "No JVM test namespaces discovered under --path"
+              {:path requested :resolved (str (:target selector))})
+    (require! (every? #(= :gesso-jvm-namespace (get-in % [:unit :type])) selected)
+              "Path selector admitted a non-JVM job")
+    {:runtimes (:runtimes inventory) :jobs selected}))
+
 (defn- inventory-manifest! [root head status inventory]
   (let [jobs (:jobs inventory)
         runtimes (or (:runtimes inventory)
@@ -2365,12 +2437,14 @@
                  (println "SHARD UNSAFE TO CLEAN:" (.getMessage ex)))))))))
 
 (defn- parse-run-options! [argv]
-  (loop [args (vec argv) n nil scope nil]
+  (loop [args (vec argv) n nil scope nil path nil]
     (cond
       (empty? args)
       (do (require! (some? n)
-                    "Usage: shard run --workers N [--scope SCOPE | --inventory COMMAND ARG ...]")
-          {:workers n :scope scope})
+                    "Usage: shard run --workers N [--scope SCOPE | --path TEST-PATH | --inventory COMMAND ARG ...]")
+          (do (require! (not (and scope path))
+                        "--path and --scope are mutually exclusive")
+              (cond-> {:workers n :scope scope} path (assoc :path path))))
 
       (= "--workers" (first args))
       (do (require! (and (nil? n) (second args))
@@ -2379,22 +2453,28 @@
                             (catch Exception _ nil))]
             (require! (and parsed (<= 1 parsed 256))
                       "--workers must be 1..256")
-            (recur (subvec args 2) parsed scope)))
+            (recur (subvec args 2) parsed scope path)))
 
       (= "--scope" (first args))
       (do (require! (and (nil? scope) (second args)
                          (re-matches #"[a-z][a-z:]*" (second args)))
                     "Missing or duplicate --scope")
-          (recur (subvec args 2) n (second args)))
+          (recur (subvec args 2) n (second args) path))
+
+      (= "--path" (first args))
+      (do (require! (and (nil? path) (nil? scope) (second args)
+                         (not (str/blank? (second args))))
+                    "Missing/duplicate --path, or conflict with --scope")
+          (recur (subvec args 2) n scope (second args)))
 
       (= "--inventory" (first args))
-      (do (require! (and (some? n) (nil? scope))
-                    "Cannot combine --inventory and --scope; supply --workers N first")
+      (do (require! (and (some? n) (nil? scope) (nil? path))
+                    "Cannot combine --inventory with --scope or --path; supply --workers N first")
           (let [cmd (vec (rest args))]
             (require! (string-vector? cmd) "Missing inventory command")
             {:workers n :inventory-command cmd}))
 
-      :else (fail! "Usage: shard run --workers N [--scope SCOPE | --inventory COMMAND ARG ...]"))))
+      :else (fail! "Usage: shard run --workers N [--scope SCOPE | --path TEST-PATH | --inventory COMMAND ARG ...]"))))
 
 (def ^:private supported-gesso-scopes
   #{"all" "quick" "jvm" "formal" "cljs" "node" "node:choreo" "node:browser"
@@ -2424,12 +2504,15 @@
   ;; This entire function can run in parallel with repository integrity.
   ;; Besides discovering and validating every job, it balances provisional
   ;; workers using historical timings before any clones are provisioned.
-  (let [inventory (run-inventory! root
-                    (if prepared?
-                      ["bb" "script/gesso_test.clj" "inventory:prepared"
-                       (or (:scope opts) "all")]
-                      (or (:inventory-command opts)
-                          (default-inventory-command root))))
+  (let [discovered (run-inventory! root
+                     (if prepared?
+                       ["bb" "script/gesso_test.clj" "inventory:prepared"
+                        (if (:path opts) "jvm" (or (:scope opts) "all"))]
+                       (or (:inventory-command opts)
+                           (default-inventory-command root))))
+        inventory (if (:path opts)
+                    (path-inventory! root (:path opts) discovered)
+                    discovered)
         _ (when prepared? (verify-prepared-jobs! (:jobs inventory)))
         provisional-status {:snapshot-guid "pending-source-snapshot"}
         manifest (inventory-manifest! root head provisional-status inventory)
@@ -2478,8 +2561,8 @@
       (fn []
         (let [head (source-revision! root)
               gesso? (gesso-project? root)
-              _ (require! (or gesso? (nil? (:scope opts)))
-                          "--scope requires a Gesso project with prepared inventory")
+              _ (require! (or gesso? (and (nil? (:scope opts)) (nil? (:path opts))))
+                          "--scope/--path requires a Gesso project with prepared inventory")
               _ (when (:scope opts)
                   (require! (contains? supported-gesso-scopes (:scope opts))
                             "Unsupported Gesso test scope" {:scope (:scope opts)}))
@@ -2532,7 +2615,8 @@
                             (canonical-edn {:format :shard/source :version 1
                                             :git-head head
                                             :preflight preflight
-                                            :scope (when gesso? (or (:scope opts) "all"))
+                                            :scope (when (and gesso? (not (:path opts))) (or (:scope opts) "all"))
+                                            :path (:path opts)
                                             :ygg-run-id (:run-id status)
                                             :ygg-snapshot (:snapshot status)
                                             :inventory-sha256 (:inventory-sha256 manifest)
